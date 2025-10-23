@@ -19,15 +19,62 @@ from readpcap import ReadPcap
 from unpack_float import unpack_float
 
 
-def _fftshift_and_abs(csi_matrix: np.ndarray) -> np.ndarray:
+def _get_valid_subcarriers(bw: int) -> list:
     """
-    Aplica fftshift por columnas y devuelve la magnitud absoluta.
-    csi_matrix: (num_packets, nfft) complejo
+    Devuelve los índices de subportadoras válidas según el estándar WiFi,
+    eliminando DC y bandas de guarda.
+    
+    Parameters:
+    -----------
+    bw : int
+        Ancho de banda en MHz (20, 40, 80)
+    
+    Returns:
+    --------
+    list : Índices de subportadoras válidas centrados en 0
+    """
+    VALID_SUBCARRIERS = {
+        20: list(range(-26, 0)) + list(range(1, 27)),      # 52 subportadoras
+        40: list(range(-58, -1)) + list(range(2, 59)),     # 114 subportadoras
+        80: list(range(-122, -1)) + list(range(2, 123))    # 242 subportadoras
+    }
+    return VALID_SUBCARRIERS.get(bw, [])
+
+
+def _fftshift_and_abs(csi_matrix: np.ndarray, bw: int) -> tuple:
+    """
+    Aplica fftshift por columnas, filtra subportadoras válidas y devuelve la magnitud absoluta.
+    
+    Parameters:
+    -----------
+    csi_matrix : np.ndarray
+        Matriz CSI compleja (num_packets, nfft)
+    bw : int
+        Ancho de banda en MHz para determinar subportadoras válidas
+    
+    Returns:
+    --------
+    tuple : (magnitud_filtrada, índices_subportadoras_válidas)
     """
     if csi_matrix.size == 0:
-        return csi_matrix
+        return csi_matrix, []
+    
+    nfft = csi_matrix.shape[1]
     shifted = np.fft.fftshift(csi_matrix, axes=1)
-    return np.abs(shifted)
+    
+    # Obtener índices de subportadoras válidas
+    valid_subcarriers = _get_valid_subcarriers(bw)
+    if not valid_subcarriers:
+        # Si no hay definición, usar todas
+        return np.abs(shifted), list(range(-nfft//2, nfft//2))
+    
+    # Convertir índices centrados en 0 a índices de array
+    valid_indices = [idx + nfft//2 for idx in valid_subcarriers]
+    
+    # Filtrar solo subportadoras válidas
+    shifted_filtered = shifted[:, valid_indices]
+    
+    return np.abs(shifted_filtered), valid_subcarriers
 
 
 def _normalize_per_packet(mag_matrix: np.ndarray) -> np.ndarray:
@@ -94,12 +141,13 @@ def _parse_core_ss_from_old_header(payload_bytes: bytes, magic_off: int) -> tupl
     return None, None, None, None
 
 
-def _plot_groups(groups, nfft: int, normalize: bool, save_png: bool, output_path: str):
+def _plot_groups(groups, nfft: int, bw: int, normalize: bool, save_png: bool, output_path: str):
     """
     Dibuja una figura con un bloque por cada (core, ss):
       - Arriba: heatmap de amplitud (tiempo vs subportadoras)
       - Abajo: media de amplitud con banda ±1 std
     groups: dict[(core, ss)] -> np.ndarray de forma (num_packets, nfft) complejo
+    bw: Ancho de banda en MHz para filtrar subportadoras válidas
     """
     if not groups:
         print('No hay datos para visualizar.')
@@ -119,12 +167,12 @@ def _plot_groups(groups, nfft: int, normalize: bool, save_png: bool, output_path
         if data.size == 0:
             continue
 
-        mag = _fftshift_and_abs(data)
+        mag, valid_subcarriers = _fftshift_and_abs(data, bw)
         if normalize:
             mag = _normalize_per_packet(mag)
 
         num_packets = mag.shape[0]
-        x = np.arange(-nfft // 2, nfft // 2)  # subportadoras centradas
+        x = np.array(valid_subcarriers)  # subportadoras válidas centradas en 0
 
         # Heatmap (arriba) - subplot en posición (g_idx, 0) de un grid de num_groups x 2
         ax1 = plt.subplot(num_groups, 2, g_idx * 2 + 1)
@@ -134,7 +182,7 @@ def _plot_groups(groups, nfft: int, normalize: bool, save_png: bool, output_path
             extent=[1, num_packets, x[-1] + 0.5, x[0] - 0.5],
             cmap='jet'
         )
-        ax1.set_title(f'Core {core} — SS {ss} | Amplitude Heatmap')
+        ax1.set_title(f'Core {core} — SS {ss} | Amplitude Heatmap ({len(valid_subcarriers)} subcarriers)')
         ax1.set_xlabel('Packet number (Time)')
         ax1.set_ylabel('Subcarrier Index')
         plt.colorbar(im, ax=ax1)
@@ -149,7 +197,7 @@ def _plot_groups(groups, nfft: int, normalize: bool, save_png: bool, output_path
         ax2.set_xlim([x[0] - 0.5, x[-1] + 0.5])
         ax2.set_xlabel('Subcarrier Index')
         ax2.set_ylabel('Magnitude')
-        ax2.set_title('Mean Amplitude with Std Deviation')
+        ax2.set_title(f'Mean Amplitude with Std Deviation ({len(valid_subcarriers)} valid subcarriers)')
         ax2.legend()
 
     plt.tight_layout()
@@ -209,20 +257,24 @@ def main():
     # ========== CONFIGURACIÓN ==========
     CHIP = '4366c0'           # fijo: este script es específico para bcm4366c0
     BW = 20               # 20 / 40 / 80 MHz
-    FILE = './J_noBF_20Mhz_1x4_M1_1Mo_A2.pcap'   # ruta al .pcap
-    NPKTS_MAX = 12791         # límite de paquetes a procesar
-    NORMALIZE = True          # normalizar magnitud por paquete
+    FILE = './pcap_files/rewis_A2/E_noBF_20Mhz_1x1_M1_1Mo_A2.pcap'   # ruta al .pcap
+    NPKTS_MAX = 4000         # límite de paquetes a procesar
+    NORMALIZE = False          # normalizar magnitud por paquete
     SAVE_PNG = False          # guardar figura a PNG (True/False)
-    OUTPUT_PATH = 'csi_cores_4366c0.png'  # ruta de salida si SAVE_PNG=True
-
+    OUTPUT_PATH = './csireader_image/S_20_1x4_A2.png'  # ruta de salida si SAVE_PNG=True
+ 
     # ========== CONSTANTES ==========
     HOFFSET = 16              # header antiguo Nexmon: offset en palabras de 32 bits
     NFFT = int(BW * 3.2)      # tamaño FFT
 
+    valid_subcarriers_list = _get_valid_subcarriers(BW)
+    num_valid = len(valid_subcarriers_list) if valid_subcarriers_list else NFFT
+    
     print('CSI Reader — BCM4366C0 (formato antiguo)')
     print('=' * 60)
     print(f'Chip: {CHIP}')
     print(f'Bandwidth: {BW} MHz  -> NFFT={NFFT}')
+    print(f'Valid subcarriers: {num_valid} (eliminando DC y bandas de guarda)')
     print(f'File: {FILE}')
     print(f'Max packets: {NPKTS_MAX}')
     print()
@@ -316,7 +368,7 @@ def main():
         print(f'  Grupo (core={key[0]}, ss={key[1]}): {groups[key].shape[0]} paquetes')
 
     # Visualización
-    _plot_groups(groups, NFFT, NORMALIZE, SAVE_PNG, OUTPUT_PATH)
+    _plot_groups(groups, NFFT, BW, NORMALIZE, SAVE_PNG, OUTPUT_PATH)
 
 
 if __name__ == '__main__':
