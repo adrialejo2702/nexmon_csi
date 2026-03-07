@@ -15,3 +15,36 @@ Module.symvers
 /src/ucode_compressed.c
 /*-sdio.bin
 *.swp
+
+# macOS
+.DS_Store
+*/.DS_Store
+
+# Python bytecode / caches
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# Python virtual environment
+.venv/
+
+# Other common virtualenv names
+venv/
+env/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Matlab backups / generated files
+*.asv
+*.autosave
+*.mex*
+slprj/
+*_ert_rtw/
+
+# CSI reader generated images (can be regenerated)
+utils/matlab/csireader_image/
+
+# User data (pcap captures)
+utils/matlab/pcap_files/
