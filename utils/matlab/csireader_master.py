@@ -7,6 +7,7 @@ bcm4366c0 y mostrando únicamente un heatmap de amplitudes.
 from __future__ import annotations
 
 from collections import Counter
+from pathlib import Path
 from typing import Dict, List, Tuple
 
 import struct
@@ -65,11 +66,16 @@ def _parse_csi_udp_header(payload: np.ndarray) -> Tuple[dict, bool, int]:
     chanspec = struct.unpack_from("<H", payload_bytes, csi_offset + 14)[0]
     chip_version = struct.unpack_from("<H", payload_bytes, csi_offset + 16)[0]
 
-    # Para bcm4366c0 en formato extendido, el core está en el byte alto de csiconf
-    # Valores observados: 0x0000, 0x0100, 0x0200, 0x0300 -> core = 0, 1, 2, 3
-    core = (csiconf >> 8) & 0xFF
-    # Spatial stream en bits bajos (aunque en capturas reales suele ser 0)
-    spatial_stream = csiconf & 0x7
+    # Decodificación de core/SS:
+    # - Formato genérico (docs Nexmon): bits 0-2 core, bits 3-5 spatial stream
+    # - En capturas reales de bcm4366c0 (chip_version en ACCEPTED_CHIP_IDS),
+    #   el core viene codificado en el byte alto de csiconf y el SS observado es 0.
+    if chip_version in ACCEPTED_CHIP_IDS:
+        core = (csiconf >> 8) & 0xFF
+        spatial_stream = 0
+    else:
+        core = csiconf & 0x7
+        spatial_stream = (csiconf >> 3) & 0x7
 
     bw_code = (chanspec >> 11) & 0x7
     bandwidth = BANDWIDTH_MAP.get(bw_code, 0)
@@ -137,7 +143,7 @@ def _plot_heatmap(csi_array: np.ndarray, normalize: bool, title: str, ax: plt.Ax
 
 def _collect_csi_packets(
     file_path: str,
-    max_packets: int,
+    max_packets: int | None,
     fallback_bw: int,
 ) -> Dict[str, object]:
     """Extrae CSI y metadatos exclusivamente de paquetes bcm4366c0."""
@@ -145,7 +151,10 @@ def _collect_csi_packets(
     reader.open(file_path)
 
     frames = reader.all()
-    limit = min(len(frames), max_packets)
+    if max_packets is None or max_packets <= 0:
+        limit = len(frames)
+    else:
+        limit = min(len(frames), max_packets)
 
     reader.from_start()
 
@@ -239,10 +248,55 @@ def _collect_csi_packets(
     }
 
 
+def _resolve_pcap_path(base_dir: Path, user_input: str, default_suffix: str) -> Path:
+    raw = (user_input or "").strip()
+    if not raw:
+        raw = default_suffix
+
+    candidate = Path(raw)
+    if not candidate.is_absolute():
+        candidate = base_dir / raw
+
+    if candidate.exists() and candidate.is_file():
+        return candidate
+
+    # Si el usuario solo puso el nombre del fichero, intentamos localizarlo dentro del base_dir.
+    name_only = Path(raw).name
+    matches = list(base_dir.rglob(name_only))
+    matches = [p for p in matches if p.is_file() and p.suffix.lower() == ".pcap"]
+
+    if len(matches) == 1:
+        return matches[0]
+
+    print("\nNo se encontró el archivo PCAP.")
+    print(f"- Entrada          : {raw}")
+    print(f"- Intento (base+in): {candidate}")
+    if matches:
+        print("\nCoincidencias encontradas (elige una y pégala como ruta relativa dentro de la base):")
+        for p in matches[:25]:
+            print(f"  - {p.relative_to(base_dir)}")
+        if len(matches) > 25:
+            print(f"  ... ({len(matches) - 25} más)")
+    else:
+        print(f"\nBase de búsqueda: {base_dir}")
+
+    raise SystemExit(2)
+
+
 def main() -> None:
-    FILE = "./pcap_files/mydata/GOLD_DISK/captura_home_empty1_10000_60s_36_20.pcap"
+    script_dir = Path(__file__).resolve().parent
+    PCAP_BASE_DIR = script_dir / "pcap_files" / "mydata" / "GOLD_DISK"
+    DEFAULT_SUFFIX = "captura_ping1x4/captura_ping1x4_30s_36_20_20260315_170304.pcap"
+
+    user = input(
+        "Introduce la terminación de la ruta del .pcap (relativa a "
+        f"{PCAP_BASE_DIR})\n"
+        f"Ejemplo: {DEFAULT_SUFFIX}\n"
+        f"Pulsa Enter para usar el ejemplo: "
+    )
+    FILE = str(_resolve_pcap_path(PCAP_BASE_DIR, user, DEFAULT_SUFFIX))
     BW_FALLBACK = 20
-    NPKTS_MAX = 40000
+    NPKTS_MAX = None  # Sin límite de paquetes
     NORMALIZE = True
     SHOW_TABLE = True
 
@@ -250,7 +304,7 @@ def main() -> None:
     print("=" * 60)
     print(f"Archivo   : {FILE}")
     print(f"Fallback BW (cuando header=0): {BW_FALLBACK} MHz")
-    print(f"Máx. pkts : {NPKTS_MAX}")
+    print(f"Máx. pkts : {'sin límite' if (NPKTS_MAX is None or NPKTS_MAX <= 0) else NPKTS_MAX}")
     print(f"Normalize : {NORMALIZE}")
 
     result = _collect_csi_packets(FILE, NPKTS_MAX, BW_FALLBACK)
