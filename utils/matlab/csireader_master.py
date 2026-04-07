@@ -10,6 +10,7 @@ from collections import Counter
 from pathlib import Path
 from typing import Dict, List, Tuple
 
+import re
 import struct
 
 import matplotlib.pyplot as plt
@@ -102,7 +103,12 @@ def _parse_csi_udp_header(payload: np.ndarray) -> Tuple[dict, bool, int]:
     return header, magic == 0x1111, csi_offset
 
 
-def _plot_heatmap(csi_array: np.ndarray, normalize: bool, title: str, ax: plt.Axes | None = None) -> None:
+def _plot_heatmap(
+    csi_array: np.ndarray,
+    title: str,
+    ax: plt.Axes | None = None,
+    packet_numbers: List[int] | None = None,
+) -> None:
     """Genera un heatmap de amplitudes (tiempo vs subportadoras)."""
     if csi_array.size == 0:
         print("No hay datos CSI para graficar.")
@@ -111,10 +117,10 @@ def _plot_heatmap(csi_array: np.ndarray, normalize: bool, title: str, ax: plt.Ax
     shifted = np.fft.fftshift(csi_array, axes=1)
     magnitude = np.abs(shifted)
 
-    if normalize:
-        max_vals = magnitude.max(axis=1, keepdims=True)
-        max_vals[max_vals == 0] = 1
-        magnitude = magnitude / max_vals
+    # Normalización siempre activa (flujo único de trabajo).
+    max_vals = magnitude.max(axis=1, keepdims=True)
+    max_vals[max_vals == 0] = 1
+    magnitude = magnitude / max_vals
 
     num_packets, fft_len = magnitude.shape
     subcarrier_axis = np.arange(-fft_len // 2, fft_len // 2)
@@ -131,44 +137,92 @@ def _plot_heatmap(csi_array: np.ndarray, normalize: bool, title: str, ax: plt.Ax
         extent=[1, num_packets, subcarrier_axis[-1] + 0.5, subcarrier_axis[0] - 0.5],
         cmap="jet",
     )
-    fig.colorbar(im, ax=ax, label="Magnitud (normalizada" if normalize else "Magnitud")
+    fig.colorbar(im, ax=ax, label="Magnitud (normalizada)")
     ax.set_xlabel("Número de paquete")
     ax.set_ylabel("Índice de subportadora (centrado en 0)")
     ax.set_title(title)
+    ax.set_xlim(1, num_packets)
+
+    if packet_numbers and len(packet_numbers) == num_packets:
+        # Mantener la geometría de imshow y mostrar etiquetas con IDs reales.
+        nticks = min(8, num_packets)
+        tick_positions = np.linspace(1, num_packets, nticks, dtype=int)
+        tick_positions = np.unique(tick_positions)
+        tick_labels = [str(packet_numbers[pos - 1]) for pos in tick_positions]
+        ax.set_xticks(tick_positions)
+        ax.set_xticklabels(tick_labels)
 
     if own_axis:
         fig.tight_layout()
         plt.show(block=True)
 
+def _parse_packet_range_spec(spec: str) -> tuple[int, int | None]:
+    """Convierte el formato del usuario en un rango de paquetes.
 
-def _collect_csi_packets(
+    Formatos soportados:
+    - '' o Enter => (1, None) -> sin límite
+    - 'fin'       => (1, fin)
+    - 'inicio-'  => (inicio, None)
+    - 'inicio-fin'=> (inicio, fin)
+
+    Nota: se asume numeración 1..N y el extremo final es inclusivo.
+    """
+    raw = (spec or "").strip()
+    if not raw:
+        return 1, None
+
+    if "-" in raw:
+        left, right = raw.split("-", 1)
+        left = left.strip()
+        right = right.strip()
+
+        start = int(left) if left else 1
+        end = int(right) if right else None
+    else:
+        start = 1
+        end = int(raw)
+
+    if start < 1:
+        raise ValueError("El inicio del rango debe ser >= 1.")
+    if end is not None and end < start:
+        raise ValueError("El final del rango debe ser >= al inicio.")
+
+    return start, end
+
+
+def _collect_csi_packets_interval(
     file_path: str,
-    max_packets: int | None,
+    packet_start: int,
+    packet_end: int | None,
     fallback_bw: int,
 ) -> Dict[str, object]:
-    """Extrae CSI y metadatos exclusivamente de paquetes bcm4366c0."""
+    """Extrae CSI (bcm4366c0) seleccionando solo un intervalo de paquetes válidos.
+
+    `packet_start` / `packet_end` siguen la numeración 1..N del usuario (fin inclusivo).
+    """
     reader = ReadPcap()
     reader.open(file_path)
 
     frames = reader.all()
-    if max_packets is None or max_packets <= 0:
-        limit = len(frames)
-    else:
-        limit = min(len(frames), max_packets)
-
     reader.from_start()
 
     csi_vectors: List[np.ndarray] = []
     packets_info: List[dict] = []
     core_groups: Dict[int, List[np.ndarray]] = {}
     core_packets: Dict[int, List[dict]] = {}
-    debug_headers: List[Tuple[int, int, int, int]] = []
+    start_idx = packet_start - 1  # 0-based sobre paquetes CSI decodificados
+    end_idx = None if packet_end is None else packet_end - 1
 
-    processed = 0
+    decoded_count = 0  # nº de paquetes CSI decodificados encontrados (incluye los fuera del rango)
+    included_count = 0  # nº de paquetes CSI que realmente se guardan (dentro del rango)
     skipped = 0
     packet_idx = 0
 
-    while processed < limit:
+    while True:
+        # Si ya hemos decodificado el último paquete del rango, no necesitamos seguir.
+        if end_idx is not None and decoded_count > end_idx:
+            break
+
         frame = reader.next()
         if frame is None:
             break
@@ -218,27 +272,28 @@ def _collect_csi_packets(
             continue
 
         csi_vec = _decode_csi4366(raw_words, nfft)
-        csi_vectors.append(csi_vec)
-        packets_info.append(header)
-        core = header["core"]
-        core_groups.setdefault(core, []).append(csi_vec)
-        core_packets.setdefault(core, []).append(header)
+        decoded_idx = decoded_count  # 0-based
 
-        if len(debug_headers) < 8:
-            debug_headers.append((packet_idx, header["core"], header["spatial_stream"], header["csiconf"], header["chanspec"]))
-        processed += 1
+        # Decide si guardarlo según el rango del usuario.
+        if decoded_idx >= start_idx and (end_idx is None or decoded_idx <= end_idx):
+            header["csi_packet_number"] = decoded_idx + 1
+            csi_vectors.append(csi_vec)
+            packets_info.append(header)
+            core = header["core"]
+            core_groups.setdefault(core, []).append(csi_vec)
+            core_packets.setdefault(core, []).append(header)
+
+            included_count += 1
+
+        decoded_count += 1
 
     reader.close()
 
     print("\n========= RESUMEN =========")
-    print(f"Total paquetes en PCAP: {len(frames)}")
-    print(f"Procesados    : {processed}")
-    print(f"Saltados      : {skipped}")
-
-    if debug_headers:
-        print("\nPrimeros paquetes decodificados (idx, core, ss, csiconf, chanspec):")
-        for pkt_idx, core_val, ss_val, csiconf_val, chanspec_val in debug_headers:
-            print(f"  #{pkt_idx:04d} -> core={core_val}, ss={ss_val}, csiconf=0x{csiconf_val:04X}, chanspec=0x{chanspec_val:04X}")
+    print(f"Total paquetes (frames) en PCAP: {len(frames)}")
+    print(f"Decodificados CSI               : {decoded_count}")
+    print(f"Guardados en el rango          : {included_count}")
+    print(f"Saltados                         : {skipped}")
 
     return {
         "csi_vectors": csi_vectors,
@@ -283,6 +338,17 @@ def _resolve_pcap_path(base_dir: Path, user_input: str, default_suffix: str) -> 
     raise SystemExit(2)
 
 
+def _extract_capture_seconds_from_filename(file_name: str) -> int | None:
+    """Extrae la duración de captura desde nombres tipo '*_300s_*'."""
+    match = re.search(r"_(\d+)s(?:_|\.|$)", file_name)
+    if not match:
+        raise ValueError(f"No se pudo extraer duración de captura desde: {file_name}")
+    seconds = int(match.group(1))
+    if seconds <= 0:
+        raise ValueError(f"Duración de captura no válida ({seconds}s) en: {file_name}")
+    return seconds
+
+
 def main() -> None:
     script_dir = Path(__file__).resolve().parent
     PCAP_BASE_DIR = script_dir / "pcap_files" / "mydata" / "GOLD_DISK"
@@ -296,18 +362,25 @@ def main() -> None:
     )
     FILE = str(_resolve_pcap_path(PCAP_BASE_DIR, user, DEFAULT_SUFFIX))
     BW_FALLBACK = 20
-    NPKTS_MAX = None  # Sin límite de paquetes
-    NORMALIZE = True
-    SHOW_TABLE = True
+    packet_range_spec = input(
+        "Introduce el intervalo de paquetes CSI a visualizar (Enter = sin límite). "
+        "Formas: 'inicio-fin', 'fin' o 'inicio-': "
+    ).strip()
+    try:
+        packet_start, packet_end = _parse_packet_range_spec(packet_range_spec)
+    except ValueError as exc:
+        print(f"Entrada no válida: {exc}")
+        return
 
     print("CSI Reader — bcm4366c0 (formato extendido, heatmap)")
     print("=" * 60)
-    print(f"Archivo   : {FILE}")
+    print(f"Archivo   : {Path(FILE).name}")
     print(f"Fallback BW (cuando header=0): {BW_FALLBACK} MHz")
-    print(f"Máx. pkts : {'sin límite' if (NPKTS_MAX is None or NPKTS_MAX <= 0) else NPKTS_MAX}")
-    print(f"Normalize : {NORMALIZE}")
+    rango_str = f"{packet_start}-{packet_end}" if packet_end is not None else f"{packet_start}-fin"
+    print(f"Rango pkts : {rango_str}")
+    print("Normalize : True")
 
-    result = _collect_csi_packets(FILE, NPKTS_MAX, BW_FALLBACK)
+    result = _collect_csi_packets_interval(FILE, packet_start, packet_end, BW_FALLBACK)
     csi_vectors = result["csi_vectors"]
     packets_info = result["packets_info"]
     core_groups = result["core_groups"]
@@ -317,23 +390,11 @@ def main() -> None:
         print("Sin paquetes válidos (bcm4366c0) para visualizar.")
         return
 
-    max_len = max(len(vec) for vec in csi_vectors)
-    csi_array = np.zeros((len(csi_vectors), max_len), dtype=np.complex128)
-    for idx, vec in enumerate(csi_vectors):
-        csi_array[idx, : len(vec)] = vec
-
     bandwidth_counts = Counter(pkt["bandwidth"] for pkt in packets_info)
     print("Anchuras detectadas (MHz):", dict(bandwidth_counts))
-
-    if SHOW_TABLE:
-        limit = min(20, len(packets_info))
-        print("\nPrimeros paquetes:")
-        print("-" * 80)
-        for idx, pkt in enumerate(packets_info[:limit], start=1):
-            print(
-                f"{idx:04d} | RSSI={pkt['rssi']:>4} | Seq={pkt['seq']:>5} | Core={pkt['core']} | "
-                f"SS={pkt['spatial_stream']} | Chan={pkt['channel']:>3} | BW={pkt['bandwidth']:>3} | MAC={pkt['src_mac']}"
-            )
+    capture_seconds = _extract_capture_seconds_from_filename(Path(FILE).name)
+    avg_rate = len(csi_vectors) / capture_seconds
+    print(f"Tasa media captura: {avg_rate:.2f} paquetes/s ({len(csi_vectors)} paquetes en {capture_seconds}s)")
 
     core_items = [(core, core_groups[core]) for core in sorted(core_groups.keys()) if core_groups[core]]
 
@@ -359,8 +420,16 @@ def main() -> None:
         for idx, vec in enumerate(data):
             array_core[idx, : len(vec)] = vec
 
+        packet_numbers_core = [pkt.get("csi_packet_number") for pkt in core_packets.get(core, [])]
+        packet_numbers_core = [pkt for pkt in packet_numbers_core if pkt is not None]
+
         print(f"\nVisualizando core {core} — paquetes: {len(data)}")
-        _plot_heatmap(array_core, NORMALIZE, title=f"Amplitude Heatmap — Core {core}", ax=ax)
+        _plot_heatmap(
+            array_core,
+            title=f"Amplitude Heatmap — Core {core}",
+            ax=ax,
+            packet_numbers=packet_numbers_core if len(packet_numbers_core) == len(data) else None,
+        )
 
     total_axes = axes.size
     if total_axes > ncores:
