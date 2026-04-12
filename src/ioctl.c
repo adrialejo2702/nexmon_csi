@@ -115,6 +115,10 @@
 #define COREMASK                0x8a7
 #endif
 
+#if NEXMON_CHIP == CHIP_VER_BCM4366c0
+uint32 no_phase_jumps = 0;
+#endif
+
 int 
 wlc_ioctl_hook(struct wlc_info *wlc, int cmd, char *arg, int len, void *wlc_if)
 {
@@ -201,6 +205,16 @@ wlc_ioctl_hook(struct wlc_info *wlc, int cmd, char *arg, int len, void *wlc_if)
             }
                 break;
         }
+#if NEXMON_CHIP == CHIP_VER_BCM4366c0
+        case 526:
+        {
+            if (wlc->hw->up && len >= sizeof(uint32)) {
+                no_phase_jumps = *(uint32 *)arg;
+                ret = IOCTL_SUCCESS;
+            }
+            break;
+        }
+#endif
         case NEX_READ_OBJMEM:
         {
             set_mpc(wlc, 0);

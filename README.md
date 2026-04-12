@@ -9,7 +9,7 @@ on the Broadcom Wi-Fi Chips listed below.
 WiFi Chip   | Firmware Version  | Used in
 ----------- | ----------------- | --------------------
 bcm4339     | 6_37_34_43        | Nexus 5
-bcm43455c0  | 7_45_189          | Raspberry Pi B3+/B4
+bcm43455c0  | 7_45_189          | Raspberry Pi 3B+/4B/5
 bcm4358     | 7_112_300_14_sta  | Nexus 6P
 bcm4366c0   | 10_10_122_20      | Asus RT-AC86U
 
@@ -63,7 +63,7 @@ To compile the source code, you are required to first clone the original nexmon 
 ## bcm4339, bcm4358
 
 The following steps will get you started on Xubuntu 16.04 LTS:
-1. Install some dependencies: `sudo apt-get install git gawk qpdf adb flex bison`
+1. Install some dependencies: `sudo apt-get install git gawk qpdf adb flex bison xxd`
 2. **Only necessary for x86_64 systems**, install i386 libs: 
   ```
   sudo dpkg --add-architecture i386
@@ -87,12 +87,14 @@ The following steps will get you started on Xubuntu 16.04 LTS:
 
 ## bcm43455c0
 
-On your Raspberry Pi 3B+/4 running Raspbian/Raspberry Pi OS with kernel 4.19 or 5.4 run the following:
+_Update:_ We've added a Makefile ([`Makefile.rpi`](https://github.com/seemoo-lab/nexmon_csi/blob/dd6767ec25c32d9b1d904197167f8c04ae79122f/Makefile.rpi)) dedicated to Raspberry Pi OS with recent kernel versions that no longer require a modified `brcmfmac` driver (that support vendor commands). A tutorial on using Nexmon CSI on recent kernel versions and additionally the Raspberry Pi 5 can be found in [discussion #395](https://github.com/seemoo-lab/nexmon_csi/discussions/395#discussion-9196947).
+
+For Raspbian / Raspberry Pi OS running kernel versions 4.19, 5.4, and 5.10 perform the following on your Raspberry Pi 3B+/4B:
 1. Make sure the following commands are executed as root: `sudo su`
 2. Upgrade your Raspbian installation: `apt-get update && apt-get upgrade`
 3. Install the kernel headers to build the driver and some dependencies: 
 ```
-      apt install raspberrypi-kernel-headers git libgmp3-dev gawk qpdf bison flex make
+      apt install raspberrypi-kernel-headers git libgmp3-dev gawk qpdf bison flex make xxd
       apt install automake autoconf libtool texinfo
       reboot
 ```
@@ -115,7 +117,7 @@ On your Raspberry Pi 3B+/4 running Raspbian/Raspberry Pi OS with kernel 4.19 or 
 
 ## bcm4366c0
 This install instruction works only with devices based on ARM processors with 64 Bit, because the used compiler and the base-driver are chosen for this destination architecture. The following steps will get you started on Xubuntu 18.04.3 LTS:
-1. Install some dependencies: `sudo apt-get install git gawk qpdf flex bison`
+1. Install some dependencies: `sudo apt-get install git gawk qpdf flex bison xxd`
 2. **Only necessary for x86_64 systems**, install i386 libs: 
   ```
   sudo dpkg --add-architecture i386
@@ -144,7 +146,7 @@ This install instruction works only with devices based on ARM processors with 64
   cd ../nexutil
   echo "typedef uint32_t uint;" > types.h
   sed -i 's/argp-extern/argp/' nexutil.c
-  ${AMCC}gcc -static -o nexutil nexutil.c bcmwifi_channels.c b64-encode.c b64-decode.c -DBUILD_ON_RPI -DVERSION=0 -I. -I../libnexio -I../../patches/include -L../libnexio/ -lnexio
+  ${AMCC}gcc -static -o nexutil nexutil.c bcmutils.c bcmwifi_channels.c b64-encode.c b64-decode.c -DBUILD_ON_RPI -DVERSION=0 -I. -I./include -I../libnexio -I../../patches/include -L../libnexio/ -lnexio
   scp nexutil admin@<address of your rt-ac86u>:/jffs/nexutil
   ssh admin@<address of your rt-ac86u> "/bin/chmod +x /jffs/nexutil"
   ```
