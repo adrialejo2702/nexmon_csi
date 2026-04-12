@@ -23,19 +23,32 @@ fi
 echo "Enviando pings a $IP durante $TIEMPO segundos con intervalo $INTERVALO s..."
 
 START=$(date +%s)
-FIN=$(( START + TIEMPO ))
-COUNT=0
 
-while [ "$(date +%s)" -lt "$FIN" ]; do
-  # Enviar 1 paquete, sin mostrar salida
-  ping -c 1 "$IP" > /dev/null 2>&1
-  COUNT=$((COUNT + 1))
-  sleep "$INTERVALO"
-done
+OUT_FILE="$(mktemp -t ping_timer.XXXXXX)"
+
+# Un único proceso ping a alta frecuencia; al finalizar lo interrumpimos con SIGINT
+# para que imprima el resumen ("packets transmitted").
+# En macOS el resumen sale por stdout, así que capturamos stdout+stderr.
+ping -i "$INTERVALO" "$IP" >"$OUT_FILE" 2>&1 &
+PING_PID=$!
+
+sleep "$TIEMPO"
+
+kill -INT "$PING_PID" >/dev/null 2>&1 || true
+wait "$PING_PID" >/dev/null 2>&1 || true
 
 END=$(date +%s)
 REAL_TIME=$((END - START))
 
-echo "Paquetes transmitidos: $COUNT"
+# Extraer el número de "packets transmitted" del resumen (macOS/Linux)
+TX="$(awk '
+  /packets transmitted/ {
+    for (i=1; i<=NF; i++) if ($i=="packets") { print $(i-1); exit }
+  }
+' "$OUT_FILE")"
+
+rm -f "$OUT_FILE" >/dev/null 2>&1 || true
+
+echo "Paquetes transmitidos: ${TX:-0}"
 echo "Tiempo total: ${REAL_TIME}s"
 echo "Envío de pings finalizado."
