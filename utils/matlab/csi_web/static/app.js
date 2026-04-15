@@ -6,11 +6,12 @@ let browseRelPath = "";
 let lastFileId = "";
 /** @type {File | null} PCAP elegido desde una carpeta local (modo subir carpeta) */
 let pendingFolderPcap = null;
+let previewPythonPollTimer = null;
+let currentLabels = [];
+let selectedSummary = null;
 
 /** @type {{ kind: "json", body: object } | { kind: "local", file: File } | null} */
 let summaryContext = null;
-
-let absoluteSummaryTimer = null;
 
 function escapeHtml(s) {
   const d = document.createElement("div");
@@ -27,6 +28,7 @@ function escapeHtmlAttr(s) {
 
 function clearFileSummary() {
   summaryContext = null;
+  selectedSummary = null;
   const wrap = $("file-summary");
   const content = $("file-summary-content");
   if (!wrap || !content) return;
@@ -68,12 +70,22 @@ function renderSummaryData(data) {
       : "—";
 
   const durTitle = data.duration_note ? escapeHtmlAttr(data.duration_note) : "";
+  const rgbCount = Number(data.export_rgb_count || 0);
+  const grayCount = Number(data.export_gray_count || 0);
+  let exportText = "No";
+  if (rgbCount > 0 || grayCount > 0) {
+    const parts = [];
+    if (rgbCount > 0) parts.push(`${rgbCount.toLocaleString()} RGB`);
+    if (grayCount > 0) parts.push(`${grayCount.toLocaleString()} Gray`);
+    exportText = `Sí (${parts.join(" + ")})`;
+  }
 
   content.innerHTML = `<dl class="file-summary__dl">
       <dt>Fichero</dt><dd>${escapeHtml(data.file_name)}</dd>
       <dt>Paquetes CSI capturados</dt><dd>${Number(data.csi_packets_valid).toLocaleString()}</dd>
       <dt>Duración captura</dt><dd${durTitle ? ` title="${durTitle}"` : ""}>${durText}</dd>
       <dt>Paquetes/s</dt><dd>${rateText}</dd>
+      <dt>Imágenes exportadas</dt><dd>${exportText}</dd>
     </dl>`;
 }
 
@@ -96,8 +108,10 @@ async function fetchSummaryJson(body) {
             ? detail.map((d) => d.msg || d).join("; ")
           : res.statusText;
       renderSummaryError(msg || "Error al analizar el fichero");
+      selectedSummary = null;
       return;
     }
+    selectedSummary = data;
     renderSummaryData(data);
   } catch (e) {
     renderSummaryError(e instanceof Error ? e.message : "Error de red");
@@ -120,38 +134,14 @@ async function fetchSummaryLocal(file) {
             ? detail.map((d) => d.msg || d).join("; ")
           : res.statusText;
       renderSummaryError(msg || "Error al analizar el fichero");
+      selectedSummary = null;
       return;
     }
+    selectedSummary = data;
     renderSummaryData(data);
   } catch (e) {
     renderSummaryError(e instanceof Error ? e.message : "Error de red");
   }
-}
-
-function scheduleAbsoluteSummary() {
-  clearTimeout(absoluteSummaryTimer);
-  absoluteSummaryTimer = setTimeout(() => {
-    void tryAbsoluteSummary();
-  }, 450);
-}
-
-function tryAbsoluteSummary() {
-  if ($("mode").value !== "absolute") return;
-  const p = $("absolute-path").value.trim();
-  if (p.length < 5 || !/\.pcap$/i.test(p)) {
-    clearFileSummary();
-    return;
-  }
-  summaryContext = {
-    kind: "json",
-    body: {
-      mode: "absolute",
-      absolute_path: p,
-      browse_relative_path: "",
-      file_id: "",
-    },
-  };
-  void fetchSummaryJson(summaryContext.body);
 }
 
 function showError(msg) {
@@ -160,15 +150,284 @@ function showError(msg) {
   el.classList.toggle("hidden", !msg);
 }
 
-function getUploadSource() {
-  const r = document.querySelector('input[name="upload-source"]:checked');
-  return r ? r.value : "file";
+function setPreviewStatus(msg) {
+  void msg;
+}
+
+function stopPreviewPythonPolling() {
+  if (previewPythonPollTimer) {
+    clearInterval(previewPythonPollTimer);
+    previewPythonPollTimer = null;
+  }
+}
+
+function startPreviewPythonPolling() {
+  stopPreviewPythonPolling();
+  previewPythonPollTimer = setInterval(async () => {
+    try {
+      const res = await fetch("/api/preview-python-status");
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) return;
+      if (!data.running) {
+        stopPreviewPythonPolling();
+      }
+    } catch {
+      // Si falla puntualmente, mantenemos el último estado visible.
+    }
+  }, 1200);
+}
+
+function clearExportStatus() {
+  const status = $("export-status");
+  if (status) status.textContent = "";
+}
+
+function setLabelsStatus(msg) {
+  const el = $("labels-status");
+  if (!el) return;
+  el.textContent = msg || "";
+}
+
+function hasAnyExportFormatSelected() {
+  return Boolean($("export-generate-rgb").checked || $("export-generate-gray").checked);
+}
+
+function hasSelectedFile() {
+  try {
+    selectedFileBody();
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function hasValidSecondsIntervalInput() {
+  const startSec = Number.parseFloat($("label-start-sec").value);
+  const endSec = Number.parseFloat($("label-end-sec").value);
+  return Number.isFinite(startSec) && startSec >= 0 && Number.isFinite(endSec) && endSec >= startSec;
+}
+
+function updateActionButtons() {
+  const hasFile = hasSelectedFile();
+  const hasFormats = hasAnyExportFormatSelected();
+  $("preview-btn").disabled = !hasFile;
+  $("export-btn").disabled = !(hasFile && hasFormats);
+  $("add-label-btn").disabled = !(hasFile && selectedSummary && hasValidSecondsIntervalInput());
+  $("save-labels-btn").disabled = !(hasFile && currentLabels.length > 0);
+}
+
+function updateExportButtonState() {
+  updateActionButtons();
+}
+
+function selectedFileBody() {
+  const mode = $("mode").value;
+  const body = {
+    mode,
+    browse_relative_path: "",
+    file_id: "",
+  };
+  if (mode === "browse") {
+    body.browse_relative_path = $("browse-relative-path").value.trim();
+    if (!body.browse_relative_path) {
+      throw new Error("Elige un .pcap en el explorador.");
+    }
+  } else {
+    body.file_id = lastFileId;
+    if (!body.file_id) {
+      throw new Error("Sube primero un .pcap.");
+    }
+  }
+  return body;
+}
+
+function normalizeLabelsForRender(labels) {
+  return labels
+    .filter((it) => it && Number(it.start_packet) >= 1 && Number(it.end_packet) >= Number(it.start_packet))
+    .map((it) => ({
+      label: String(it.label || ""),
+      start_packet: Number(it.start_packet),
+      end_packet: Number(it.end_packet),
+    }))
+    .sort((a, b) => a.start_packet - b.start_packet);
+}
+
+function renderLabelsList() {
+  const ul = $("labels-list");
+  ul.innerHTML = "";
+  if (!currentLabels.length) {
+    const li = document.createElement("li");
+    li.textContent = "Sin etiquetas.";
+    ul.appendChild(li);
+    return;
+  }
+  currentLabels.forEach((it, idx) => {
+    const li = document.createElement("li");
+    const span = document.createElement("span");
+    span.className = "name";
+    span.textContent = `${it.start_packet}-${it.end_packet} -> ${it.label}`;
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "secondary";
+    btn.textContent = "Quitar";
+    btn.addEventListener("click", () => {
+      currentLabels.splice(idx, 1);
+      renderLabelsList();
+      setLabelsStatus("");
+    });
+    li.appendChild(span);
+    li.appendChild(btn);
+    ul.appendChild(li);
+  });
+}
+
+function clearLabelsUi() {
+  currentLabels = [];
+  renderLabelsList();
+  setLabelsStatus("");
+  updateActionButtons();
+}
+
+async function loadLabelsForSelectedFile() {
+  let body;
+  try {
+    body = selectedFileBody();
+  } catch {
+    clearLabelsUi();
+    return;
+  }
+  try {
+    const res = await fetch("/api/labels/load", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      clearLabelsUi();
+      return;
+    }
+    currentLabels = normalizeLabelsForRender(Array.isArray(data.labels) ? data.labels : []);
+    renderLabelsList();
+    updateActionButtons();
+  } catch {
+    clearLabelsUi();
+  }
+}
+
+function addLabelFromInputs() {
+  const startSec = Number.parseFloat($("label-start-sec").value);
+  const endSec = Number.parseFloat($("label-end-sec").value);
+  const label = $("label-name").value;
+  if (!selectedSummary) {
+    showError("Primero selecciona un fichero para calcular la equivalencia segundos->paquetes.");
+    return;
+  }
+  const duration = Number(selectedSummary.duration_seconds || 0);
+  const totalPkts = Number(selectedSummary.csi_packets_valid || 0);
+  if (!(duration > 0) || !(totalPkts > 0)) {
+    showError("No se pudo obtener duración/paquetes del fichero para convertir segundos.");
+    return;
+  }
+  if (!Number.isFinite(startSec) || startSec < 0 || !Number.isFinite(endSec) || endSec < startSec) {
+    showError("Intervalo inválido: usa inicio/fin en segundos con fin >= inicio.");
+    return;
+  }
+  if (!label) {
+    showError("Selecciona una etiqueta.");
+    return;
+  }
+  const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
+  const s0 = clamp(startSec, 0, duration);
+  const s1 = clamp(endSec, 0, duration);
+  const start = clamp(Math.floor((s0 / duration) * totalPkts) + 1, 1, totalPkts);
+  const end = clamp(Math.ceil((s1 / duration) * totalPkts), start, totalPkts);
+  showError("");
+  currentLabels.push({
+    start_packet: start,
+    end_packet: end,
+    label,
+  });
+  currentLabels = normalizeLabelsForRender(currentLabels);
+  renderLabelsList();
+  setLabelsStatus(`Etiqueta añadida en paquetes: ${start}-${end} (pendiente de guardar).`);
+  updateActionButtons();
+}
+
+async function saveLabels() {
+  let body;
+  try {
+    body = selectedFileBody();
+  } catch (e) {
+    showError(e instanceof Error ? e.message : "Selecciona un fichero para guardar etiquetas.");
+    return false;
+  }
+  try {
+    const res = await fetch("/api/labels/save", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        ...body,
+        labels: currentLabels.map((it) => ({
+          label: it.label,
+          start_packet: it.start_packet,
+          end_packet: it.end_packet,
+        })),
+      }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      const detail = data.detail;
+      const msg = typeof detail === "string" ? detail : res.statusText;
+      showError(msg || "Error guardando etiquetas.");
+      return false;
+    }
+    showError("");
+    setLabelsStatus(`Etiquetas guardadas: ${data.saved}.`);
+    let generatedMsg = "";
+    if (Boolean($("generate-impulse-labeled-images").checked)) {
+      const payload = {
+        ...body,
+        generate_rgb: Boolean($("export-generate-rgb").checked),
+        generate_gray: Boolean($("export-generate-gray").checked),
+        regenerate_existing: Boolean($("export-regenerate-existing").checked),
+        export_with_label_name: true,
+      };
+      const hasFormats = payload.generate_rgb || payload.generate_gray;
+      if (!hasFormats) {
+        showError("Selecciona al menos RGB o Gray para generar imágenes con etiquetas.");
+        return false;
+      }
+      const res2 = await fetch("/api/export-windows", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+      const data2 = await res2.json().catch(() => ({}));
+      if (!res2.ok) {
+        const detail2 = data2.detail;
+        const msg2 = typeof detail2 === "string" ? detail2 : res2.statusText;
+        showError(msg2 || "Error generando imágenes con etiquetas Edge Impulse.");
+        return false;
+      }
+      if (data2.status === "skipped_existing") {
+        generatedMsg = " Imágenes ya existentes (activa Regenerar para sobrescribir).";
+      } else {
+        generatedMsg = ` Imágenes Edge Impulse generadas: ${data2.labeled_windows_generated}.`;
+      }
+    }
+    setLabelsStatus(`Etiquetas guardadas: ${data.saved}.${generatedMsg}`);
+    updateActionButtons();
+    return true;
+  } catch (e) {
+    showError(e instanceof Error ? e.message : "Error de red guardando etiquetas.");
+    return false;
+  }
 }
 
 function syncUploadSubpanels() {
-  const fromFolder = getUploadSource() === "folder";
-  $("upload-single-wrap").classList.toggle("hidden", fromFolder);
-  $("upload-folder-wrap").classList.toggle("hidden", !fromFolder);
+  // Modo upload simplificado: solo carpeta local.
+  $("upload-folder-wrap").classList.remove("hidden");
 }
 
 function resetFolderUploadUi() {
@@ -179,20 +438,18 @@ function resetFolderUploadUi() {
 }
 
 function resetSingleFileUploadUi() {
-  $("upload-file").value = "";
+  // Ya no se usa input de archivo único.
 }
 
 function setModePanels() {
   const mode = $("mode").value;
   clearFileSummary();
+  clearExportStatus();
+  clearLabelsUi();
   $("browse-panel").classList.toggle("hidden", mode !== "browse");
   $("upload-panel").classList.toggle("hidden", mode !== "upload");
-  $("absolute-panel").classList.toggle("hidden", mode !== "absolute");
   if (mode === "upload") {
     syncUploadSubpanels();
-  }
-  if (mode === "absolute") {
-    scheduleAbsoluteSummary();
   }
 }
 
@@ -246,10 +503,10 @@ async function loadBrowse(path) {
           mode: "browse",
           browse_relative_path: rel,
           file_id: "",
-          absolute_path: "",
         },
       };
       void fetchSummaryJson(summaryContext.body);
+      void loadLabelsForSelectedFile();
     });
     li.appendChild(span);
     li.appendChild(btn);
@@ -266,6 +523,7 @@ function parentBrowsePath() {
 
 function onUploadFolderChange() {
   clearFileSummary();
+  clearExportStatus();
   lastFileId = "";
   pendingFolderPcap = null;
   $("upload-folder-selected").textContent = "";
@@ -306,6 +564,7 @@ function onUploadFolderChange() {
       $("upload-status").textContent = "";
       summaryContext = { kind: "local", file };
       void fetchSummaryLocal(file);
+      clearLabelsUi();
     });
     li.appendChild(span);
     li.appendChild(btn);
@@ -314,20 +573,10 @@ function onUploadFolderChange() {
 }
 
 async function doUpload() {
-  let file = null;
-  if (getUploadSource() === "folder") {
-    file = pendingFolderPcap;
-    if (!file) {
-      $("upload-status").textContent = "Elige carpeta y pulsa Usar en un .pcap";
-      return;
-    }
-  } else {
-    const input = $("upload-file");
-    if (!input.files || !input.files[0]) {
-      $("upload-status").textContent = "Selecciona un .pcap";
-      return;
-    }
-    file = input.files[0];
+  const file = pendingFolderPcap;
+  if (!file) {
+    $("upload-status").textContent = "Elige carpeta y pulsa Usar en un .pcap";
+    return;
   }
   const fd = new FormData();
   fd.append("file", file, file.name);
@@ -350,10 +599,10 @@ async function doUpload() {
         mode: "upload",
         file_id: lastFileId,
         browse_relative_path: "",
-        absolute_path: "",
       },
     };
     await fetchSummaryJson(summaryContext.body);
+    await loadLabelsForSelectedFile();
   } finally {
     $("upload-btn").disabled = false;
   }
@@ -361,50 +610,24 @@ async function doUpload() {
 
 async function doPreview() {
   showError("");
-  const img = $("preview-img");
-  img.classList.add("hidden");
-  img.removeAttribute("src");
-
-  const mode = $("mode").value;
   const packet_range = $("packet-range").value.trim();
-
-  const body = {
-    mode,
-    browse_relative_path: "",
-    file_id: "",
-    absolute_path: "",
-    packet_range,
-  };
-
-  if (mode === "browse") {
-    body.browse_relative_path = $("browse-relative-path").value.trim();
-    if (!body.browse_relative_path) {
-      showError("Elige un .pcap en el explorador.");
-      return;
-    }
-  } else if (mode === "upload") {
-    body.file_id = lastFileId;
-    if (!body.file_id) {
-      showError("Sube primero un .pcap.");
-      return;
-    }
-  } else {
-    body.absolute_path = $("absolute-path").value.trim();
-    if (!body.absolute_path) {
-      showError("Indica la ruta absoluta del .pcap.");
-      return;
-    }
+  let body;
+  try {
+    body = { ...selectedFileBody(), packet_range };
+  } catch (e) {
+    showError(e instanceof Error ? e.message : "Falta seleccionar fichero");
+    return;
   }
 
   $("preview-btn").disabled = true;
   try {
-    const res = await fetch("/api/preview", {
+    const res = await fetch("/api/preview-python", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
     });
+    const data = await res.json().catch(() => ({}));
     if (!res.ok) {
-      const data = await res.json().catch(() => ({}));
       const detail = data.detail;
       const msg =
         typeof detail === "string"
@@ -415,12 +638,65 @@ async function doPreview() {
       showError(msg || "Error al generar la vista previa");
       return;
     }
-    const blob = await res.blob();
-    const url = URL.createObjectURL(blob);
-    img.src = url;
-    img.classList.remove("hidden");
+    startPreviewPythonPolling();
   } finally {
     $("preview-btn").disabled = false;
+  }
+}
+
+async function doExportWindows() {
+  showError("");
+  const status = $("export-status");
+  const rgb = Boolean($("export-generate-rgb").checked);
+  const grayChecked = Boolean($("export-generate-gray").checked);
+  if (!rgb && !grayChecked) {
+    showError("Selecciona al menos una opción de exportación: color o blanco y negro.");
+    return;
+  }
+  let body;
+  try {
+    body = selectedFileBody();
+  } catch (e) {
+    showError(e instanceof Error ? e.message : "Falta seleccionar fichero");
+    return;
+  }
+  const payload = {
+    ...body,
+    generate_rgb: rgb,
+    generate_gray: grayChecked,
+    regenerate_existing: Boolean($("export-regenerate-existing").checked),
+    export_with_label_name: false,
+  };
+  $("export-btn").disabled = true;
+  status.textContent = "Exportando imágenes…";
+  try {
+    const res = await fetch("/api/export-windows", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      const detail = data.detail;
+      const msg =
+        typeof detail === "string"
+          ? detail
+          : Array.isArray(detail)
+            ? detail.map((d) => d.msg || d).join("; ")
+            : res.statusText;
+      showError(msg || "Error exportando imágenes");
+      status.textContent = "";
+      return;
+    }
+    if (data.status === "skipped_existing") {
+      status.textContent = "Ya existen imágenes generadas. Activa \"Regenerar\" si quieres sobrescribir.";
+      return;
+    }
+    const rgbTxt = data.rgb_dir ? "RGB" : "";
+    const grayTxt = data.gray_dir ? (rgbTxt ? " + Gray" : "Gray") : "";
+    status.textContent = `Exportación completada: ${data.windows_generated} imágenes ${rgbTxt}${grayTxt}.`;
+  } finally {
+    updateExportButtonState();
   }
 }
 
@@ -428,48 +704,28 @@ $("mode").addEventListener("change", setModePanels);
 $("browse-up").addEventListener("click", () => loadBrowse(parentBrowsePath()));
 $("browse-refresh").addEventListener("click", () => loadBrowse(browseRelPath));
 
-document.querySelectorAll('input[name="upload-source"]').forEach((el) => {
-  el.addEventListener("change", () => {
-    syncUploadSubpanels();
-    lastFileId = "";
-    $("upload-status").textContent = "";
-    clearFileSummary();
-    if (getUploadSource() === "folder") {
-      resetSingleFileUploadUi();
-    } else {
-      resetFolderUploadUi();
-    }
-    const uf = $("upload-file");
-    if (getUploadSource() === "file" && uf.files && uf.files[0]) {
-      summaryContext = { kind: "local", file: uf.files[0] };
-      void fetchSummaryLocal(uf.files[0]);
-    }
-  });
-});
-
-$("upload-file").addEventListener("change", () => {
-  lastFileId = "";
-  $("upload-status").textContent = "";
-  const input = $("upload-file");
-  const f = input.files && input.files[0];
-  if (f && getUploadSource() === "file") {
-    summaryContext = { kind: "local", file: f };
-    void fetchSummaryLocal(f);
-  } else {
-    clearFileSummary();
-  }
-});
-
 $("upload-folder").addEventListener("change", onUploadFolderChange);
 
 $("upload-btn").addEventListener("click", doUpload);
 $("preview-btn").addEventListener("click", doPreview);
-
-$("absolute-path").addEventListener("input", scheduleAbsoluteSummary);
-$("absolute-path").addEventListener("blur", () => {
-  void tryAbsoluteSummary();
+$("export-btn").addEventListener("click", doExportWindows);
+$("add-label-btn").addEventListener("click", addLabelFromInputs);
+$("save-labels-btn").addEventListener("click", () => {
+  void saveLabels();
+});
+["export-generate-rgb", "export-generate-gray"].forEach((id) => {
+  $(id).addEventListener("change", updateExportButtonState);
+});
+["label-start-sec", "label-end-sec", "label-name"].forEach((id) => {
+  $(id).addEventListener("input", updateActionButtons);
+  $(id).addEventListener("change", updateActionButtons);
+});
+["browse-relative-path", "generate-impulse-labeled-images"].forEach((id) => {
+  $(id).addEventListener("change", updateActionButtons);
 });
 
 setModePanels();
 syncUploadSubpanels();
+updateExportButtonState();
+renderLabelsList();
 loadBrowse("");

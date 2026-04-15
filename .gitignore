@@ -18,7 +18,7 @@ Module.symvers
 
 # macOS
 .DS_Store
-*/.DS_Store
+**/.DS_Store
 
 # Python bytecode / caches
 __pycache__/
@@ -48,7 +48,3 @@ utils/matlab/csireader_image/
 
 # User data (pcap captures)
 utils/matlab/pcap_files/
-.DS_Store
-utils/.DS_Store
-utils/matlab/.DS_Store
-utils/matlab/pcap_files/.DS_Store

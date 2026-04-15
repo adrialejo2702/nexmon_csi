@@ -21,8 +21,7 @@
         <label for="mode">Modo</label>
         <select id="mode">
           <option value="browse">Explorador (solo carpeta GOLD_DISK)</option>
-          <option value="upload">Subir archivo o carpeta local</option>
-          <option value="absolute">Ruta absoluta en este ordenador</option>
+          <option value="upload">Subir carpeta local</option>
         </select>
 
         <div id="browse-panel" class="mode-fields">
@@ -37,18 +36,7 @@
         </div>
 
         <div id="upload-panel" class="mode-fields hidden">
-          <fieldset class="upload-source">
-            <legend>Origen en tu ordenador</legend>
-            <label class="inline-label"><input type="radio" name="upload-source" value="file" checked /> Un solo archivo .pcap</label>
-            <label class="inline-label"><input type="radio" name="upload-source" value="folder" /> Carpeta (se buscan .pcap dentro)</label>
-          </fieldset>
-
-          <div id="upload-single-wrap">
-            <label for="upload-file">Archivo</label>
-            <input type="file" id="upload-file" accept=".pcap,application/vnd.tcpdump.pcap" />
-          </div>
-
-          <div id="upload-folder-wrap" class="hidden">
+          <div id="upload-folder-wrap">
             <label for="upload-folder">Carpeta</label>
             <input type="file" id="upload-folder" name="upload-folder" multiple webkitdirectory directory />
             <p class="sub">Al elegir carpeta, el navegador incluye los ficheros de las subcarpetas. Luego pulsa <strong>Usar</strong> en un .pcap y <strong>Subir</strong>.</p>
@@ -60,11 +48,6 @@
             <button type="button" id="upload-btn">Subir</button>
           </div>
           <p class="sub" id="upload-status"></p>
-        </div>
-
-        <div id="absolute-panel" class="mode-fields hidden">
-          <label for="absolute-path">Ruta absoluta del .pcap</label>
-          <input type="text" id="absolute-path" placeholder="/ruta/completa/archivo.pcap" autocomplete="off" />
         </div>
 
         <div id="file-summary" class="file-summary hidden" aria-live="polite">
@@ -79,15 +62,45 @@
         <label for="packet-range">Rango de paquetes CSI (vacío = sin límite; ej. <code class="inline-code">1-100</code>, <code class="inline-code">50</code>, <code class="inline-code">10-</code>)</label>
         <input type="text" id="packet-range" value="" autocomplete="off" />
       </section>
+
+      <section class="panel">
+        <h2>Etiquetado</h2>
+        <p class="sub">Introduce intervalo en segundos y etiqueta. La web calcula automáticamente el rango aproximado de paquetes.</p>
+        <div class="row label-row">
+          <label for="label-start-sec">Inicio (s)</label>
+          <input type="number" id="label-start-sec" min="0" step="0.1" />
+          <label for="label-end-sec">Fin (s)</label>
+          <input type="number" id="label-end-sec" min="0" step="0.1" />
+          <label for="label-name">Etiqueta</label>
+          <select id="label-name">
+            <option value="movimiento">movimiento</option>
+            <option value="vacío">vacío</option>
+            <option value="quieto">quieto</option>
+          </select>
+          <button type="button" class="secondary" id="add-label-btn">Añadir</button>
+          <button type="button" class="secondary" id="save-labels-btn">Guardar etiquetas</button>
+        </div>
+        <ul class="list labels-list" id="labels-list"></ul>
+        <div class="row" style="margin-top:0.6rem">
+          <label class="inline-label"><input type="checkbox" id="generate-impulse-labeled-images" /> Generar imágenes con etiquetas Edge Impulse</label>
+        </div>
+        <p class="sub" id="labels-status"></p>
+      </section>
       </div>
 
       <section class="panel panel--preview">
         <h2>Vista previa</h2>
         <button type="button" id="preview-btn">Generar vista previa</button>
-        <div class="err hidden" id="error-msg"></div>
-        <div class="preview-wrap">
-          <img id="preview-img" alt="Vista previa CSI" class="hidden" />
+        <div class="export-box">
+          <label class="inline-label"><input type="checkbox" id="export-generate-rgb" checked /> Exportar en color (RGB)</label>
+          <label class="inline-label"><input type="checkbox" id="export-generate-gray" /> Exportar en blanco y negro (Gray)</label>
+          <label class="inline-label"><input type="checkbox" id="export-regenerate-existing" /> Regenerar si ya existen imágenes</label>
+          <button type="button" id="export-btn" class="secondary">Exportar imágenes (1s, solape 0.5s)</button>
+          <p class="sub" id="export-status"></p>
         </div>
+        <div class="err hidden" id="error-msg"></div>
+        <p class="sub">La representación se abre en una ventana de Python (Matplotlib), igual que en <code>csireader_master.py</code>.</p>
+        <p class="sub"><strong>Importante:</strong> para representar otro intervalo, cierra primero la ventana actual.</p>
       </section>
     </main>
   </div>
