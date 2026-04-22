@@ -68,6 +68,8 @@ function renderSummaryData(data) {
           maximumFractionDigits: 2,
         })
       : "—";
+  const coresText =
+    data.cores_detected != null ? Number(data.cores_detected).toLocaleString() : "—";
 
   const durTitle = data.duration_note ? escapeHtmlAttr(data.duration_note) : "";
   const rgbCount = Number(data.export_rgb_count || 0);
@@ -84,6 +86,7 @@ function renderSummaryData(data) {
       <dt>Fichero</dt><dd>${escapeHtml(data.file_name)}</dd>
       <dt>Paquetes CSI capturados</dt><dd>${Number(data.csi_packets_valid).toLocaleString()}</dd>
       <dt>Duración captura</dt><dd${durTitle ? ` title="${durTitle}"` : ""}>${durText}</dd>
+      <dt>Cores detectados</dt><dd>${coresText}</dd>
       <dt>Paquetes/s</dt><dd>${rateText}</dd>
       <dt>Imágenes exportadas</dt><dd>${exportText}</dd>
     </dl>`;
@@ -154,6 +157,33 @@ function setPreviewStatus(msg) {
   void msg;
 }
 
+function basenameFromPath(p) {
+  return String(p || "")
+    .split("/")
+    .filter(Boolean)
+    .pop() || "";
+}
+
+function resolveSelectedPcapName(body) {
+  if (selectedSummary && selectedSummary.file_name) {
+    return String(selectedSummary.file_name);
+  }
+  if (!body) return "";
+  if (body.mode === "browse") {
+    return basenameFromPath(body.browse_relative_path || "");
+  }
+  if (pendingFolderPcap && pendingFolderPcap.name) {
+    return pendingFolderPcap.name;
+  }
+  return "";
+}
+
+function setPreviewFileName(text) {
+  const el = $("preview-file-name");
+  if (!el) return;
+  el.textContent = text || "";
+}
+
 function stopPreviewPythonPolling() {
   if (previewPythonPollTimer) {
     clearInterval(previewPythonPollTimer);
@@ -182,6 +212,30 @@ function clearExportStatus() {
   if (status) status.textContent = "";
 }
 
+function setExportProgress(percent, text, isError = false) {
+  const wrap = $("export-progress");
+  const fill = $("export-progress-fill");
+  const label = $("export-progress-text");
+  if (!wrap || !fill || !label) return;
+  wrap.classList.remove("hidden");
+  fill.style.width = `${Math.max(0, Math.min(100, percent))}%`;
+  fill.style.backgroundColor = isError ? "#c62828" : "";
+  label.textContent = text || "";
+}
+
+function resetExportProgress() {
+  const wrap = $("export-progress");
+  const fill = $("export-progress-fill");
+  const label = $("export-progress-text");
+  if (!wrap) return;
+  wrap.classList.add("hidden");
+  if (fill) {
+    fill.style.width = "0%";
+    fill.style.backgroundColor = "";
+  }
+  if (label) label.textContent = "";
+}
+
 function setLabelsStatus(msg) {
   const el = $("labels-status");
   if (!el) return;
@@ -202,8 +256,12 @@ function hasSelectedFile() {
 }
 
 function hasValidSecondsIntervalInput() {
-  const startSec = Number.parseFloat($("label-start-sec").value);
-  const endSec = Number.parseFloat($("label-end-sec").value);
+  const startRaw = $("label-start-sec").value.trim();
+  const endRaw = $("label-end-sec").value.trim();
+  if (!startRaw && !endRaw) return true; // Vacío => etiquetar todo el archivo.
+  if (!startRaw || !endRaw) return false;
+  const startSec = Number.parseFloat(startRaw);
+  const endSec = Number.parseFloat(endRaw);
   return Number.isFinite(startSec) && startSec >= 0 && Number.isFinite(endSec) && endSec >= startSec;
 }
 
@@ -248,6 +306,7 @@ function normalizeLabelsForRender(labels) {
       label: String(it.label || ""),
       start_packet: Number(it.start_packet),
       end_packet: Number(it.end_packet),
+      core: String(it.core || "all"),
     }))
     .sort((a, b) => a.start_packet - b.start_packet);
 }
@@ -265,7 +324,8 @@ function renderLabelsList() {
     const li = document.createElement("li");
     const span = document.createElement("span");
     span.className = "name";
-    span.textContent = `${it.start_packet}-${it.end_packet} -> ${it.label}`;
+    const coreText = it.core === "all" ? "Todos" : `Core ${it.core}`;
+    span.textContent = `[${coreText}] ${it.start_packet}-${it.end_packet} -> ${it.label}`;
     const btn = document.createElement("button");
     btn.type = "button";
     btn.className = "secondary";
@@ -316,9 +376,13 @@ async function loadLabelsForSelectedFile() {
 }
 
 function addLabelFromInputs() {
-  const startSec = Number.parseFloat($("label-start-sec").value);
-  const endSec = Number.parseFloat($("label-end-sec").value);
+  const startRaw = $("label-start-sec").value.trim();
+  const endRaw = $("label-end-sec").value.trim();
+  const fullFile = !startRaw && !endRaw;
+  const startSec = Number.parseFloat(startRaw);
+  const endSec = Number.parseFloat(endRaw);
   const label = $("label-name").value;
+  const core = $("label-core").value;
   if (!selectedSummary) {
     showError("Primero selecciona un fichero para calcular la equivalencia segundos->paquetes.");
     return;
@@ -329,28 +393,39 @@ function addLabelFromInputs() {
     showError("No se pudo obtener duración/paquetes del fichero para convertir segundos.");
     return;
   }
-  if (!Number.isFinite(startSec) || startSec < 0 || !Number.isFinite(endSec) || endSec < startSec) {
-    showError("Intervalo inválido: usa inicio/fin en segundos con fin >= inicio.");
-    return;
-  }
   if (!label) {
     showError("Selecciona una etiqueta.");
     return;
   }
-  const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
-  const s0 = clamp(startSec, 0, duration);
-  const s1 = clamp(endSec, 0, duration);
-  const start = clamp(Math.floor((s0 / duration) * totalPkts) + 1, 1, totalPkts);
-  const end = clamp(Math.ceil((s1 / duration) * totalPkts), start, totalPkts);
+  let start = 1;
+  let end = totalPkts;
+  if (!fullFile) {
+    if (!startRaw || !endRaw) {
+      showError("Si introduces intervalo, rellena inicio y fin.");
+      return;
+    }
+    if (!Number.isFinite(startSec) || startSec < 0 || !Number.isFinite(endSec) || endSec < startSec) {
+      showError("Intervalo inválido: usa inicio/fin en segundos con fin >= inicio.");
+      return;
+    }
+    const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
+    const s0 = clamp(startSec, 0, duration);
+    const s1 = clamp(endSec, 0, duration);
+    start = clamp(Math.floor((s0 / duration) * totalPkts) + 1, 1, totalPkts);
+    end = clamp(Math.ceil((s1 / duration) * totalPkts), start, totalPkts);
+  }
   showError("");
   currentLabels.push({
     start_packet: start,
     end_packet: end,
     label,
+    core,
   });
   currentLabels = normalizeLabelsForRender(currentLabels);
   renderLabelsList();
-  setLabelsStatus(`Etiqueta añadida en paquetes: ${start}-${end} (pendiente de guardar).`);
+  const coreTxt = core === "all" ? "Todos" : `Core ${core}`;
+  const intervalTxt = fullFile ? "todo el archivo" : `paquetes: ${start}-${end}`;
+  setLabelsStatus(`Etiqueta añadida en ${intervalTxt}, ${coreTxt} (pendiente de guardar).`);
   updateActionButtons();
 }
 
@@ -372,6 +447,7 @@ async function saveLabels() {
           label: it.label,
           start_packet: it.start_packet,
           end_packet: it.end_packet,
+          core: it.core || "all",
         })),
       }),
     });
@@ -445,6 +521,8 @@ function setModePanels() {
   const mode = $("mode").value;
   clearFileSummary();
   clearExportStatus();
+  resetExportProgress();
+  setPreviewFileName("");
   clearLabelsUi();
   $("browse-panel").classList.toggle("hidden", mode !== "browse");
   $("upload-panel").classList.toggle("hidden", mode !== "upload");
@@ -524,6 +602,8 @@ function parentBrowsePath() {
 function onUploadFolderChange() {
   clearFileSummary();
   clearExportStatus();
+  resetExportProgress();
+  setPreviewFileName("");
   lastFileId = "";
   pendingFolderPcap = null;
   $("upload-folder-selected").textContent = "";
@@ -610,10 +690,12 @@ async function doUpload() {
 
 async function doPreview() {
   showError("");
-  const packet_range = $("packet-range").value.trim();
+  const packet_range = "";
   let body;
   try {
     body = { ...selectedFileBody(), packet_range };
+    const pcapName = resolveSelectedPcapName(body);
+    setPreviewFileName(pcapName ? `PCAP representado: ${pcapName}` : "");
   } catch (e) {
     showError(e instanceof Error ? e.message : "Falta seleccionar fichero");
     return;
@@ -647,10 +729,12 @@ async function doPreview() {
 async function doExportWindows() {
   showError("");
   const status = $("export-status");
+  if (status) status.classList.add("hidden");
   const rgb = Boolean($("export-generate-rgb").checked);
   const grayChecked = Boolean($("export-generate-gray").checked);
   if (!rgb && !grayChecked) {
     showError("Selecciona al menos una opción de exportación: color o blanco y negro.");
+    setExportProgress(100, "Error", true);
     return;
   }
   let body;
@@ -658,6 +742,7 @@ async function doExportWindows() {
     body = selectedFileBody();
   } catch (e) {
     showError(e instanceof Error ? e.message : "Falta seleccionar fichero");
+    setExportProgress(100, "Error", true);
     return;
   }
   const payload = {
@@ -668,8 +753,9 @@ async function doExportWindows() {
     export_with_label_name: false,
   };
   $("export-btn").disabled = true;
-  status.textContent = "Exportando imágenes…";
+  status.textContent = "";
   try {
+    setExportProgress(65, "Guardando imágenes…");
     const res = await fetch("/api/export-windows", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -686,15 +772,22 @@ async function doExportWindows() {
             : res.statusText;
       showError(msg || "Error exportando imágenes");
       status.textContent = "";
+      setExportProgress(100, "Error", true);
       return;
     }
     if (data.status === "skipped_existing") {
       status.textContent = "Ya existen imágenes generadas. Activa \"Regenerar\" si quieres sobrescribir.";
+      if (status) status.classList.remove("hidden");
+      setExportProgress(100, "✔️ Finalizado");
       return;
     }
     const rgbTxt = data.rgb_dir ? "RGB" : "";
     const grayTxt = data.gray_dir ? (rgbTxt ? " + Gray" : "Gray") : "";
-    status.textContent = `Exportación completada: ${data.windows_generated} imágenes ${rgbTxt}${grayTxt}.`;
+    const coresTxt =
+      data.cores_detected != null ? ` (cores detectados: ${Number(data.cores_detected)})` : "";
+    status.textContent = `Exportación completada: ${data.windows_generated} imágenes ${rgbTxt}${grayTxt}.${coresTxt}`;
+    if (status) status.classList.remove("hidden");
+    setExportProgress(100, "✔️ Finalizado");
   } finally {
     updateExportButtonState();
   }
@@ -716,7 +809,7 @@ $("save-labels-btn").addEventListener("click", () => {
 ["export-generate-rgb", "export-generate-gray"].forEach((id) => {
   $(id).addEventListener("change", updateExportButtonState);
 });
-["label-start-sec", "label-end-sec", "label-name"].forEach((id) => {
+["label-start-sec", "label-end-sec", "label-name", "label-core"].forEach((id) => {
   $(id).addEventListener("input", updateActionButtons);
   $(id).addEventListener("change", updateActionButtons);
 });

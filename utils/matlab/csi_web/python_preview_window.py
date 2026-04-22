@@ -37,6 +37,7 @@ def main() -> int:
     args = parser.parse_args()
 
     pcap_path = Path(args.pcap)
+    pcap_name = pcap_path.name
     packet_start, packet_end = cm._parse_packet_range_spec(args.packet_range)
     result = cm._collect_csi_packets_interval(
         str(pcap_path),
@@ -70,14 +71,11 @@ def main() -> int:
         for idx, vec in enumerate(data):
             array_core[idx, : len(vec)] = vec
 
-        packet_numbers_core = [pkt.get("csi_packet_number") for pkt in core_packets.get(core, [])]
-        packet_numbers_core = [pkt for pkt in packet_numbers_core if pkt is not None]
-
         cm._plot_heatmap(
             array_core,
             title=f"Amplitude Heatmap — Core {core}",
             ax=ax,
-            packet_numbers=packet_numbers_core if len(packet_numbers_core) == len(data) else None,
+            packet_numbers=None,  # Eje local por core: 1..N_core
         )
 
     total_axes = axes.size
@@ -85,7 +83,12 @@ def main() -> int:
         for ax in axes.flatten()[ncores:]:
             ax.axis("off")
 
-    fig.suptitle("Mapas de calor por core", fontsize=14)
+    # Título visible y título de ventana para identificar rápidamente el PCAP representado.
+    fig.suptitle(f"Mapas de calor por core — {pcap_name}", fontsize=14)
+    try:
+        fig.canvas.manager.set_window_title(f"CSI Preview — {pcap_name}")
+    except Exception:
+        pass
     fig.tight_layout()
     plt.show(block=True)
     return 0

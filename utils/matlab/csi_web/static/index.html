@@ -11,7 +11,6 @@
   <div class="shell">
     <header class="app-header">
       <h1>CSI Web</h1>
-      <p class="sub">Elegir PCAP, rango de paquetes y generar heatmap (equivalente a <code>csireader_master.py</code>).</p>
     </header>
 
     <main class="layout-main">
@@ -57,15 +56,8 @@
       </section>
 
       <section class="panel">
-        <h2>Parámetros</h2>
-        <p class="sub panel-hint">El ancho de banda usado cuando la cabecera viene a 0 se deduce del <strong>nombre del fichero</strong> (p. ej. <code class="inline-code">…_36_20_…</code> → 20 MHz); si no se reconoce, se usa 20 MHz.</p>
-        <label for="packet-range">Rango de paquetes CSI (vacío = sin límite; ej. <code class="inline-code">1-100</code>, <code class="inline-code">50</code>, <code class="inline-code">10-</code>)</label>
-        <input type="text" id="packet-range" value="" autocomplete="off" />
-      </section>
-
-      <section class="panel">
         <h2>Etiquetado</h2>
-        <p class="sub">Introduce intervalo en segundos y etiqueta. La web calcula automáticamente el rango aproximado de paquetes.</p>
+        <p class="sub">Introduce intervalo en segundos y etiqueta. Si dejas inicio y fin en blanco, la etiqueta se aplica a todo el archivo.</p>
         <div class="row label-row">
           <label for="label-start-sec">Inicio (s)</label>
           <input type="number" id="label-start-sec" min="0" step="0.1" />
@@ -74,8 +66,16 @@
           <label for="label-name">Etiqueta</label>
           <select id="label-name">
             <option value="movimiento">movimiento</option>
-            <option value="vacío">vacío</option>
+            <option value="vacio">vacio</option>
             <option value="quieto">quieto</option>
+          </select>
+          <label for="label-core">Core</label>
+          <select id="label-core">
+            <option value="all">Todos</option>
+            <option value="0">Core 0</option>
+            <option value="1">Core 1</option>
+            <option value="2">Core 2</option>
+            <option value="3">Core 3</option>
           </select>
           <button type="button" class="secondary" id="add-label-btn">Añadir</button>
           <button type="button" class="secondary" id="save-labels-btn">Guardar etiquetas</button>
@@ -91,15 +91,21 @@
       <section class="panel panel--preview">
         <h2>Vista previa</h2>
         <button type="button" id="preview-btn">Generar vista previa</button>
+        <p class="sub" id="preview-file-name"></p>
         <div class="export-box">
           <label class="inline-label"><input type="checkbox" id="export-generate-rgb" checked /> Exportar en color (RGB)</label>
           <label class="inline-label"><input type="checkbox" id="export-generate-gray" /> Exportar en blanco y negro (Gray)</label>
           <label class="inline-label"><input type="checkbox" id="export-regenerate-existing" /> Regenerar si ya existen imágenes</label>
           <button type="button" id="export-btn" class="secondary">Exportar imágenes (1s, solape 0.5s)</button>
+          <div id="export-progress" class="export-progress hidden" aria-live="polite">
+            <div class="export-progress__bar">
+              <div id="export-progress-fill" class="export-progress__fill"></div>
+            </div>
+            <p id="export-progress-text" class="sub export-progress__text"></p>
+          </div>
           <p class="sub" id="export-status"></p>
         </div>
         <div class="err hidden" id="error-msg"></div>
-        <p class="sub">La representación se abre en una ventana de Python (Matplotlib), igual que en <code>csireader_master.py</code>.</p>
         <p class="sub"><strong>Importante:</strong> para representar otro intervalo, cierra primero la ventana actual.</p>
       </section>
     </main>

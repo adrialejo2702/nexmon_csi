@@ -311,6 +311,29 @@ button:disabled {
   margin-top: 0.45rem;
 }
 
+.export-progress {
+  margin-top: 0.6rem;
+}
+
+.export-progress__bar {
+  width: 100%;
+  height: 6px;
+  border-radius: 999px;
+  background: var(--upc-gray-200);
+  overflow: hidden;
+}
+
+.export-progress__fill {
+  width: 0%;
+  height: 100%;
+  background: var(--upc-blue);
+  transition: width 0.25s ease, background-color 0.2s ease;
+}
+
+.export-progress__text {
+  margin-top: 0.35rem;
+}
+
 .browse-bar {
   font-size: 0.86rem;
   color: var(--upc-gray-600);

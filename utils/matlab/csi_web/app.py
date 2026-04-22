@@ -67,7 +67,7 @@ logger = logging.getLogger(__name__)
 
 # Tras subir, el .pcap en disco es ``{uuid}.pcap``; guardamos el nombre original para BW y etiquetas.
 UPLOAD_ORIGINAL_NAMES: dict[str, str] = {}
-ALLOWED_LABELS = {"movimiento", "vacío", "quieto"}
+ALLOWED_LABELS = {"movimiento", "vacio", "quieto"}
 PYTHON_PREVIEW_PROCESS: subprocess.Popen | None = None
 
 MAX_UPLOAD_BYTES = 500 * 1024 * 1024  # 500 MiB
@@ -199,8 +199,14 @@ def _load_labels(pcap_path: Path, logical_name: str) -> list[dict]:
         label = str(item.get("label", ""))
         start = int(item.get("start_packet", 0))
         end = int(item.get("end_packet", 0))
+        core_raw = item.get("core", "all")
+        core = str(core_raw).strip().lower()
+        if core.startswith("core"):
+            core = core[4:]
+        if core not in {"all", "0", "1", "2", "3"}:
+            core = "all"
         if label in ALLOWED_LABELS and start > 0 and end >= start:
-            out.append({"label": label, "start_packet": start, "end_packet": end})
+            out.append({"label": label, "start_packet": start, "end_packet": end, "core": core})
     return out
 
 
@@ -230,10 +236,15 @@ def _parse_window_packet_interval_from_name(file_name: str) -> tuple[int, int] |
     return start, end
 
 
-def _best_label_for_window(start: int, end: int, labels: list[dict]) -> str | None:
+def _best_label_for_window(start: int, end: int, labels: list[dict], *, core: int | None = None) -> str | None:
     best_label = None
     best_overlap = 0
     for item in labels:
+        item_core = str(item.get("core", "all")).strip().lower()
+        if item_core.startswith("core"):
+            item_core = item_core[4:]
+        if core is not None and item_core not in {"all", str(core)}:
+            continue
         ls = int(item["start_packet"])
         le = int(item["end_packet"])
         ov = min(end, le) - max(start, ls) + 1
@@ -273,33 +284,6 @@ def export_window_images(
     base_stem = Path(logical_name).stem
     out_stem = f"{base_stem}_edge_impulse" if export_with_label_name else base_stem
     out_dir = pcap_path.parent / out_stem
-    out_rgb_dir = out_dir / "rgb"
-    out_gray_dir = out_dir / "gray"
-
-    rgb_exists = cwi._has_png_files(out_rgb_dir)
-    gray_exists = cwi._has_png_files(out_gray_dir)
-    rgb_blocked = generate_rgb and rgb_exists
-    gray_blocked = generate_gray and gray_exists
-    if (rgb_blocked or gray_blocked) and not regenerate_existing:
-        return {
-            "status": "skipped_existing",
-            "out_dir": str(out_dir),
-            "rgb_dir": str(out_rgb_dir) if generate_rgb else None,
-            "gray_dir": str(out_gray_dir) if generate_gray else None,
-            "message": "La carpeta de salida ya contiene imágenes generadas.",
-            "windows_generated": 0,
-            "window_packets": None,
-            "stride_packets": None,
-            "packet_rate_real": None,
-            "duration_seconds": None,
-            "csi_packets_valid": None,
-        }
-
-    if generate_rgb:
-        out_rgb_dir.mkdir(parents=True, exist_ok=True)
-    if generate_gray:
-        out_gray_dir.mkdir(parents=True, exist_ok=True)
-
     labels: list[dict] = []
     if export_with_label_name:
         labels = _load_labels(pcap_path, logical_name)
@@ -320,66 +304,131 @@ def export_window_images(
     csi_vectors = result["csi_vectors"]
     if not csi_vectors:
         raise ValueError("No hay paquetes CSI válidos para generar imágenes.")
-
-    csi_matrix = cwi._build_csi_matrix(csi_vectors)
-    total_packets = csi_matrix.shape[0]
     duration_seconds = cm._extract_capture_seconds_from_filename(Path(logical_name).name)
-    packet_rate_real = total_packets / float(duration_seconds)
-    window_packets = cwi._round_down_to_ten(packet_rate_real)
-    if window_packets <= 0:
-        raise ValueError(
-            "La tasa real calculada es demasiado baja para redondear por decenas. "
-            f"Tasa real: {packet_rate_real:.6f} pkt/s"
-        )
-    stride_packets = max(1, window_packets // 2)  # solape del 50%
-    total_windows = cwi._window_count(total_packets, window_packets, stride_packets)
-    if total_windows <= 0:
-        raise ValueError(
-            f"No hay suficientes paquetes CSI válidos: {total_packets}. "
-            f"Se necesitan al menos {window_packets}."
-        )
+    core_groups = result["core_groups"]
+    core_packets = result["core_packets"]
 
+    core_ids = sorted(core_groups.keys())
+    represented_cores = max(1, len(core_ids))
+    if export_with_label_name and not core_ids:
+        raise ValueError("No hay cores disponibles para exportación Edge Impulse.")
+
+    # Salidas siempre separadas por core (con y sin etiquetas).
+    rgb_dirs = {core: (out_dir / f"core{core}" / "rgb") for core in core_ids}
+    gray_dirs = {core: (out_dir / f"core{core}" / "gray") for core in core_ids}
+    rgb_blocked = generate_rgb and any(cwi._has_png_files(d) for d in rgb_dirs.values())
+    gray_blocked = generate_gray and any(cwi._has_png_files(d) for d in gray_dirs.values())
+
+    if (rgb_blocked or gray_blocked) and not regenerate_existing:
+        return {
+            "status": "skipped_existing",
+            "out_dir": str(out_dir),
+            "rgb_dir": str(next(iter(rgb_dirs.values()))) if generate_rgb else None,
+            "gray_dir": str(next(iter(gray_dirs.values()))) if generate_gray else None,
+            "message": "La carpeta de salida ya contiene imágenes generadas.",
+            "windows_generated": 0,
+            "window_packets": None,
+            "stride_packets": None,
+            "packet_rate_real": None,
+            "duration_seconds": None,
+            "csi_packets_valid": None,
+        }
+
+    if generate_rgb:
+        for d in rgb_dirs.values():
+            d.mkdir(parents=True, exist_ok=True)
+    if generate_gray:
+        for d in gray_dirs.values():
+            d.mkdir(parents=True, exist_ok=True)
+
+    total_packets_sum = 0
+    total_windows_sum = 0
     labeled_generated = 0
     unlabeled_skipped = 0
-    for window_idx in range(total_windows):
-        start = window_idx * stride_packets
-        end = start + window_packets
-        window = csi_matrix[start:end, :]
-        label_prefix = ""
-        if export_with_label_name:
-            label = _best_label_for_window(start + 1, end, labels)
-            if not label:
-                unlabeled_skipped += 1
-                continue
-            # Edge Impulse infiere etiqueta por el prefijo antes del primer punto.
-            safe_label = re.sub(r"[^A-Za-z0-9_-]+", "_", label).strip("_") or "unlabeled"
-            label_prefix = f"{safe_label}."
+    packet_rate_real_last = 0.0
+    window_packets_last = 0
+    stride_packets_last = 0
 
-        if generate_rgb:
-            image_name_rgb = f"{label_prefix}img_{window_idx + 1:06d}_pkts_{start + 1:06d}_{end:06d}.png"
-            out_file_rgb = out_rgb_dir / image_name_rgb
-            cwi._save_window_image(window, out_file_rgb, normalize=True, cmap="jet")
-        if generate_gray:
-            image_name_gray = f"{label_prefix}img_{window_idx + 1:06d}_pkts_{start + 1:06d}_{end:06d}_gray.png"
-            out_file_gray = out_gray_dir / image_name_gray
-            cwi._save_window_image_gray(window, out_file_gray, normalize=True)
-        if export_with_label_name:
-            labeled_generated += 1
+    processing_cores = core_ids
+    for core in processing_cores:
+        core_vectors = core_groups.get(core, [])
+        core_pkts = core_packets.get(core, [])
+        if not core_vectors:
+            continue
+
+        csi_matrix = cwi._build_csi_matrix(core_vectors)
+        total_packets = csi_matrix.shape[0]
+        total_packets_sum += total_packets
+        packet_rate_real = total_packets / float(duration_seconds)
+        window_packets = cwi._round_down_to_ten(packet_rate_real)
+        if window_packets <= 0:
+            continue
+        stride_packets = max(1, window_packets // 2)
+        total_windows = cwi._window_count(total_packets, window_packets, stride_packets)
+        if total_windows <= 0:
+            continue
+
+        packet_numbers_core_global = [pkt.get("csi_packet_number") for pkt in core_pkts]
+        packet_numbers_core_global = [int(pkt) for pkt in packet_numbers_core_global if pkt is not None]
+        if len(packet_numbers_core_global) != total_packets:
+            packet_numbers_core_global = list(range(1, total_packets + 1))
+        packet_numbers_core_local = list(range(1, total_packets + 1))
+
+        packet_rate_real_last = packet_rate_real
+        window_packets_last = window_packets
+        stride_packets_last = stride_packets
+        total_windows_sum += total_windows
+
+        for window_idx in range(total_windows):
+            start = window_idx * stride_packets
+            end = start + window_packets
+            window = csi_matrix[start:end, :]
+            # Numeración local (1..N del core) para el nombre del archivo.
+            start_pkt_local = packet_numbers_core_local[start]
+            end_pkt_local = packet_numbers_core_local[end - 1]
+            # Numeración global para lógica de solape con etiquetas.
+            start_pkt_global = packet_numbers_core_global[start]
+            end_pkt_global = packet_numbers_core_global[end - 1]
+
+            label_prefix = ""
+            if export_with_label_name:
+                label = _best_label_for_window(start_pkt_global, end_pkt_global, labels, core=core)
+                if not label:
+                    unlabeled_skipped += 1
+                    continue
+                safe_label = re.sub(r"[^A-Za-z0-9_-]+", "_", label).strip("_") or "unlabeled"
+                label_prefix = f"{safe_label}."
+
+            if generate_rgb:
+                image_name_rgb = (
+                    f"{label_prefix}img_{window_idx + 1:06d}_pkts_{start_pkt_local:06d}_{end_pkt_local:06d}.png"
+                )
+                out_file_rgb = rgb_dirs[core] / image_name_rgb
+                cwi._save_window_image(window, out_file_rgb, normalize=True, cmap="jet")
+            if generate_gray:
+                image_name_gray = (
+                    f"{label_prefix}img_{window_idx + 1:06d}_pkts_{start_pkt_local:06d}_{end_pkt_local:06d}_gray.png"
+                )
+                out_file_gray = gray_dirs[core] / image_name_gray
+                cwi._save_window_image_gray(window, out_file_gray, normalize=True)
+            if export_with_label_name:
+                labeled_generated += 1
 
     return {
         "status": "ok",
         "out_dir": str(out_dir),
-        "rgb_dir": str(out_rgb_dir) if generate_rgb else None,
-        "gray_dir": str(out_gray_dir) if generate_gray else None,
-        "windows_generated": int(total_windows),
-        "window_packets": int(window_packets),
-        "stride_packets": int(stride_packets),
-        "packet_rate_real": float(round(packet_rate_real, 6)),
+        "rgb_dir": str(next(iter(rgb_dirs.values()))) if generate_rgb else None,
+        "gray_dir": str(next(iter(gray_dirs.values()))) if generate_gray else None,
+        "windows_generated": int(total_windows_sum),
+        "window_packets": int(window_packets_last) if window_packets_last else None,
+        "stride_packets": int(stride_packets_last) if stride_packets_last else None,
+        "packet_rate_real": float(round(packet_rate_real_last, 6)) if packet_rate_real_last else None,
+        "cores_detected": int(represented_cores),
         "duration_seconds": int(duration_seconds),
-        "csi_packets_valid": int(total_packets),
+        "csi_packets_valid": int(total_packets_sum),
         "bw_fallback_mhz": int(bw),
         "export_with_label_name": bool(export_with_label_name),
-        "labeled_windows_generated": int(labeled_generated if export_with_label_name else total_windows),
+        "labeled_windows_generated": int(labeled_generated if export_with_label_name else total_windows_sum),
         "unlabeled_windows_skipped": int(unlabeled_skipped if export_with_label_name else 0),
     }
 
@@ -429,18 +478,11 @@ def build_preview_png(pcap_path: Path, packet_range: str, bw_fallback: int) -> b
         for idx, vec in enumerate(data):
             array_core[idx, : len(vec)] = vec
 
-        packet_numbers_core = [
-            pkt.get("csi_packet_number") for pkt in core_packets.get(core, [])
-        ]
-        packet_numbers_core = [pkt for pkt in packet_numbers_core if pkt is not None]
-
         cm._plot_heatmap(
             array_core,
             title=f"Amplitude Heatmap — Core {core}",
             ax=ax,
-            packet_numbers=packet_numbers_core
-            if len(packet_numbers_core) == len(data)
-            else None,
+            packet_numbers=None,  # Eje local por core: 1..N_core
         )
 
     total_axes = axes.size
@@ -486,27 +528,17 @@ def build_preview_plot_data(pcap_path: Path, packet_range: str, bw_fallback: int
         array_core = np.zeros((len(data), max_len_core), dtype=np.complex128)
         for idx, vec in enumerate(data):
             array_core[idx, : len(vec)] = vec
-        mag = np.abs(np.fft.fftshift(array_core, axes=1))
+        mag, subcarrier_axis = cm._prepare_magnitude_for_plot(array_core)
         row_max = np.max(mag, axis=1, keepdims=True)
         row_max[row_max == 0.0] = 1.0
         mag = mag / row_max
 
-        packet_numbers_core = [pkt.get("csi_packet_number") for pkt in core_packets.get(core, [])]
-        packet_numbers_core = [int(pkt) for pkt in packet_numbers_core if pkt is not None]
         num_packets = len(data)
         x_positions = list(range(1, num_packets + 1))
-        if len(packet_numbers_core) == num_packets:
-            nticks = min(8, num_packets)
-            tick_positions = np.linspace(1, num_packets, nticks, dtype=int)
-            tick_positions = np.unique(tick_positions)
-            tick_text = [str(packet_numbers_core[pos - 1]) for pos in tick_positions]
-            x_ticks = tick_positions.tolist()
-        else:
-            tick_text = [str(x) for x in x_positions]
-            x_ticks = x_positions
+        tick_text = [str(x) for x in x_positions]
+        x_ticks = x_positions
 
-        nsub = int(mag.shape[1])
-        y_vals = list(range((-nsub) // 2, (-nsub) // 2 + nsub))
+        y_vals = subcarrier_axis.astype(int).tolist()
         cores_data[str(core)] = {
             "x": x_positions,
             "y": y_vals,
@@ -573,9 +605,10 @@ class LabelsLoadBody(BaseModel):
 
 
 class LabelItem(BaseModel):
-    label: Literal["movimiento", "vacío", "quieto"]
+    label: Literal["movimiento", "vacio", "quieto"]
     start_packet: int = Field(ge=1)
     end_packet: int = Field(ge=1)
+    core: str = Field(default="all")
 
 
 class LabelsSaveBody(LabelsLoadBody):
@@ -658,6 +691,12 @@ def api_labels_save(body: LabelsSaveBody) -> dict:
                 raise ValueError("Cada etiqueta debe cumplir: fin >= inicio.")
             if it["label"] not in ALLOWED_LABELS:
                 raise ValueError(f"Etiqueta no permitida: {it['label']}")
+            core = str(it.get("core", "all")).strip().lower()
+            if core.startswith("core"):
+                core = core[4:]
+            if core not in {"all", "0", "1", "2", "3"}:
+                raise ValueError("Core no permitido. Usa: all, 0, 1, 2 o 3.")
+            it["core"] = core
         path = _save_labels(pcap_path, logical_name, labels)
         return {"status": "ok", "saved": len(labels), "labels_file": str(path)}
     except ValueError as exc:

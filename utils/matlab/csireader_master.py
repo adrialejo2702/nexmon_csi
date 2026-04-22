@@ -114,16 +114,14 @@ def _plot_heatmap(
         print("No hay datos CSI para graficar.")
         return
 
-    shifted = np.fft.fftshift(csi_array, axes=1)
-    magnitude = np.abs(shifted)
+    magnitude, subcarrier_axis = _prepare_magnitude_for_plot(csi_array)
 
     # Normalización siempre activa (flujo único de trabajo).
     max_vals = magnitude.max(axis=1, keepdims=True)
     max_vals[max_vals == 0] = 1
     magnitude = magnitude / max_vals
 
-    num_packets, fft_len = magnitude.shape
-    subcarrier_axis = np.arange(-fft_len // 2, fft_len // 2)
+    num_packets, _fft_len = magnitude.shape
 
     own_axis = ax is None
     if own_axis:
@@ -155,6 +153,43 @@ def _plot_heatmap(
     if own_axis:
         fig.tight_layout()
         plt.show(block=True)
+
+
+def _get_valid_subcarriers_for_fft_len(fft_len: int, include_pilots: bool = False) -> list[int]:
+    """Devuelve subportadoras válidas (centradas en 0) para 20/40/80 MHz.
+
+    Se eliminan guard bands y DC. Los pilotos también se excluyen por defecto
+    para representar únicamente portadoras de datos.
+    """
+    valid_by_fft = {
+        64: list(range(-26, 0)) + list(range(1, 27)),      # 20 MHz
+        128: list(range(-58, -1)) + list(range(2, 59)),    # 40 MHz
+        256: list(range(-122, -1)) + list(range(2, 123)),  # 80 MHz
+    }
+    pilot_by_fft = {
+        64: [-21, -7, 7, 21],
+        128: [-53, -25, -11, 11, 25, 53],
+        256: [-103, -75, -39, -11, 11, 39, 75, 103],
+    }
+    valid = valid_by_fft.get(int(fft_len))
+    if not valid:
+        return list(range(-fft_len // 2, fft_len // 2))
+    if include_pilots:
+        return valid
+    pilots = set(pilot_by_fft.get(int(fft_len), []))
+    return [sc for sc in valid if sc not in pilots]
+
+
+def _prepare_magnitude_for_plot(csi_array: np.ndarray, include_pilots: bool = False) -> tuple[np.ndarray, np.ndarray]:
+    """Aplica fftshift y filtra a subportadoras válidas para representación."""
+    shifted = np.fft.fftshift(csi_array, axes=1)
+    fft_len = shifted.shape[1]
+    valid_subcarriers = _get_valid_subcarriers_for_fft_len(fft_len, include_pilots=include_pilots)
+    valid_indices = [sc + (fft_len // 2) for sc in valid_subcarriers]
+    shifted_valid = shifted[:, valid_indices]
+    magnitude = np.abs(shifted_valid)
+    axis = np.array(valid_subcarriers, dtype=int)
+    return magnitude, axis
 
 def _parse_packet_range_spec(spec: str) -> tuple[int, int | None]:
     """Convierte el formato del usuario en un rango de paquetes.
@@ -420,15 +455,12 @@ def main() -> None:
         for idx, vec in enumerate(data):
             array_core[idx, : len(vec)] = vec
 
-        packet_numbers_core = [pkt.get("csi_packet_number") for pkt in core_packets.get(core, [])]
-        packet_numbers_core = [pkt for pkt in packet_numbers_core if pkt is not None]
-
         print(f"\nVisualizando core {core} — paquetes: {len(data)}")
         _plot_heatmap(
             array_core,
             title=f"Amplitude Heatmap — Core {core}",
             ax=ax,
-            packet_numbers=packet_numbers_core if len(packet_numbers_core) == len(data) else None,
+            packet_numbers=None,  # Eje local por core: 1..N_core
         )
 
     total_axes = axes.size

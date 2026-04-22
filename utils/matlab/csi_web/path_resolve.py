@@ -9,6 +9,20 @@ def get_gold_disk_base(matlab_dir: Path) -> Path:
     return matlab_dir / "pcap_files" / "mydata" / "GOLD_DISK"
 
 
+def _is_generated_export_dir(dir_path: Path, sibling_pcaps: set[str]) -> bool:
+    """Detecta carpetas de salida generadas por la web (para ocultarlas en el explorador)."""
+    name = dir_path.name
+    if name.endswith("_edge_impulse"):
+        return True
+    if name in sibling_pcaps:
+        return True
+    if (dir_path / "rgb").is_dir() or (dir_path / "gray").is_dir():
+        return True
+    if (dir_path / "labels.json").is_file() or (dir_path / "edge_impulse_labels.csv").is_file():
+        return True
+    return False
+
+
 def safe_relative_under_base(base: Path, rel: str) -> Path:
     """Resuelve `rel` dentro de `base`; rechaza .. y rutas absolutas."""
     raw = (rel or "").strip().replace("\\", "/")
@@ -37,10 +51,13 @@ def browse_directory(base: Path, rel: str = "") -> dict:
         raise ValueError("No es un directorio")
     dirs: list[str] = []
     pcaps: list[str] = []
+    sibling_pcaps = {p.stem for p in current.iterdir() if p.is_file() and p.suffix.lower() == ".pcap"}
     for p in sorted(current.iterdir()):
         if p.name.startswith("."):
             continue
         if p.is_dir():
+            if _is_generated_export_dir(p, sibling_pcaps):
+                continue
             dirs.append(p.name)
         elif p.suffix.lower() == ".pcap":
             pcaps.append(p.name)

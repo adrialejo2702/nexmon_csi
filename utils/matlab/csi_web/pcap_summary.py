@@ -61,6 +61,7 @@ def summarize_pcap_file(file_path: str, *, name_for_bw: str | None = None) -> di
     frames_total = 0
     csi_packets_valid = 0
     skipped = 0
+    cores_detected: set[int] = set()
     try:
         while True:
             frame = reader.next()
@@ -110,6 +111,7 @@ def summarize_pcap_file(file_path: str, *, name_for_bw: str | None = None) -> di
                 continue
 
             csi_packets_valid += 1
+            cores_detected.add(int(header["core"]))
     finally:
         reader.close()
 
@@ -123,9 +125,13 @@ def summarize_pcap_file(file_path: str, *, name_for_bw: str | None = None) -> di
 
     avg_frames_per_second: float | None = None
     avg_csi_packets_per_second: float | None = None
+    represented_cores = len(cores_detected) if cores_detected else 1
     if duration_seconds is not None and duration_seconds > 0:
         avg_frames_per_second = round(frames_total / duration_seconds, 2)
-        avg_csi_packets_per_second = round(csi_packets_valid / duration_seconds, 2)
+        avg_csi_packets_per_second = round(
+            (csi_packets_valid / represented_cores) / duration_seconds,
+            2,
+        )
 
     return {
         "file_name": file_name,
@@ -136,5 +142,6 @@ def summarize_pcap_file(file_path: str, *, name_for_bw: str | None = None) -> di
         "duration_note": duration_note,
         "avg_frames_per_second": avg_frames_per_second,
         "avg_csi_packets_per_second": avg_csi_packets_per_second,
+        "cores_detected": represented_cores,
         "bw_fallback_mhz": bw_fallback,
     }
