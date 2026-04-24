@@ -68,7 +68,7 @@ logger = logging.getLogger(__name__)
 # Tras subir, el .pcap en disco es ``{uuid}.pcap``; guardamos el nombre original para BW y etiquetas.
 UPLOAD_ORIGINAL_NAMES: dict[str, str] = {}
 ALLOWED_LABELS = {"movimiento", "vacio", "quieto"}
-PYTHON_PREVIEW_PROCESS: subprocess.Popen | None = None
+PYTHON_PREVIEW_PROCESSES: list[dict] = []
 
 MAX_UPLOAD_BYTES = 500 * 1024 * 1024  # 500 MiB
 
@@ -143,6 +143,7 @@ class PreviewBody(BaseModel):
     browse_relative_path: str = Field(default="", description="Ruta relativa al .pcap bajo GOLD_DISK")
     file_id: str = Field(default="", description="UUID devuelto por POST /api/upload")
     packet_range: str = Field(default="", description="Mismo formato que en terminal")
+    combined: bool = Field(default=False, description="Combinar cores en una sola representación")
 
 
 def _resolve_pcap_common(
@@ -257,15 +258,43 @@ def _best_label_for_window(start: int, end: int, labels: list[dict], *, core: in
 def _export_images_info(pcap_path: Path, logical_name: str) -> dict:
     """Estado de exportación existente para el fichero seleccionado."""
     out_dir = pcap_path.parent / Path(logical_name).stem
-    rgb_dir = out_dir / "rgb"
-    gray_dir = out_dir / "gray"
-    rgb_count = len(list(rgb_dir.glob("*.png"))) if rgb_dir.exists() else 0
-    gray_count = len(list(gray_dir.glob("*.png"))) if gray_dir.exists() else 0
+    combined_dir = out_dir / "combined"
+    rgb_count = len(list(out_dir.rglob("*.png"))) if out_dir.exists() else 0
+    combined_count = len(list(combined_dir.glob("*.png"))) if combined_dir.exists() else 0
     return {
-        "export_images_exist": (rgb_count + gray_count) > 0,
+        "export_images_exist": rgb_count > 0,
         "export_rgb_count": rgb_count,
-        "export_gray_count": gray_count,
+        "export_combined_count": combined_count,
     }
+
+
+def _build_combined_core_matrix(core_groups: dict[int, list[np.ndarray]]) -> np.ndarray:
+    """Suma cores recortando todos al mínimo número de paquetes."""
+    core_items = [(core, vecs) for core, vecs in sorted(core_groups.items()) if vecs]
+    if not core_items:
+        return np.empty((0, 0), dtype=np.complex128)
+    min_packets = min(len(vecs) for _, vecs in core_items)
+    if min_packets <= 0:
+        return np.empty((0, 0), dtype=np.complex128)
+
+    max_subcarriers = max(len(vec) for _, vecs in core_items for vec in vecs[:min_packets])
+    combined = np.zeros((min_packets, max_subcarriers), dtype=np.complex128)
+    for _, vecs in core_items:
+        mat = np.zeros((min_packets, max_subcarriers), dtype=np.complex128)
+        for idx in range(min_packets):
+            vec = vecs[idx]
+            mat[idx, : len(vec)] = vec
+        combined += mat
+    return combined
+
+
+def _detect_label_from_filename(name: str) -> str | None:
+    """Detecta etiqueta automáticamente desde el nombre del fichero."""
+    stem = Path(name).stem.lower()
+    for label in ("movimiento", "vacio", "quieto"):
+        if label in stem:
+            return label
+    return None
 
 
 def export_window_images(
@@ -274,18 +303,29 @@ def export_window_images(
     *,
     generate_rgb: bool,
     generate_gray: bool,
+    no_overlap: bool,
     regenerate_existing: bool,
     export_with_label_name: bool,
+    combined: bool = False,
 ) -> dict:
     """Exporta imágenes por ventanas de ~1s con solape del 50%."""
-    if not generate_rgb and not generate_gray:
+    # La exportación en web queda fija en RGB.
+    generate_gray = False
+    if not generate_rgb:
         raise ValueError("Debes seleccionar al menos una opción de exportación (RGB o Gray).")
+
+    # Detecta etiqueta automática desde el nombre del fichero.
+    auto_label = _detect_label_from_filename(logical_name)
+    # Si hay etiqueta en el nombre, forzamos modo con nombre de etiqueta.
+    if auto_label:
+        export_with_label_name = True
 
     base_stem = Path(logical_name).stem
     out_stem = f"{base_stem}_edge_impulse" if export_with_label_name else base_stem
-    out_dir = pcap_path.parent / out_stem
+    overlap_dir = "ov0" if no_overlap else "ov50"
+    out_dir = pcap_path.parent / out_stem / overlap_dir
     labels: list[dict] = []
-    if export_with_label_name:
+    if export_with_label_name and not auto_label:
         labels = _load_labels(pcap_path, logical_name)
         if not labels:
             raise ValueError(
@@ -313,18 +353,21 @@ def export_window_images(
     if export_with_label_name and not core_ids:
         raise ValueError("No hay cores disponibles para exportación Edge Impulse.")
 
-    # Salidas siempre separadas por core (con y sin etiquetas).
-    rgb_dirs = {core: (out_dir / f"core{core}" / "rgb") for core in core_ids}
-    gray_dirs = {core: (out_dir / f"core{core}" / "gray") for core in core_ids}
-    rgb_blocked = generate_rgb and any(cwi._has_png_files(d) for d in rgb_dirs.values())
-    gray_blocked = generate_gray and any(cwi._has_png_files(d) for d in gray_dirs.values())
+    combined_mode = bool(combined)
+    if combined_mode:
+        rgb_dirs = {"combined": (out_dir / "combined")}
+        rgb_blocked = generate_rgb and cwi._has_png_files(rgb_dirs["combined"])
+    else:
+        # Salidas separadas por core (siempre en color, sin carpeta rgb/gray).
+        rgb_dirs = {core: (out_dir / f"core{core}") for core in core_ids}
+        rgb_blocked = generate_rgb and any(cwi._has_png_files(d) for d in rgb_dirs.values())
 
-    if (rgb_blocked or gray_blocked) and not regenerate_existing:
+    if rgb_blocked and not regenerate_existing:
         return {
             "status": "skipped_existing",
             "out_dir": str(out_dir),
             "rgb_dir": str(next(iter(rgb_dirs.values()))) if generate_rgb else None,
-            "gray_dir": str(next(iter(gray_dirs.values()))) if generate_gray else None,
+            "gray_dir": None,
             "message": "La carpeta de salida ya contiene imágenes generadas.",
             "windows_generated": 0,
             "window_packets": None,
@@ -337,9 +380,6 @@ def export_window_images(
     if generate_rgb:
         for d in rgb_dirs.values():
             d.mkdir(parents=True, exist_ok=True)
-    if generate_gray:
-        for d in gray_dirs.values():
-            d.mkdir(parents=True, exist_ok=True)
 
     total_packets_sum = 0
     total_windows_sum = 0
@@ -349,76 +389,117 @@ def export_window_images(
     window_packets_last = 0
     stride_packets_last = 0
 
-    processing_cores = core_ids
-    for core in processing_cores:
-        core_vectors = core_groups.get(core, [])
-        core_pkts = core_packets.get(core, [])
-        if not core_vectors:
-            continue
-
-        csi_matrix = cwi._build_csi_matrix(core_vectors)
-        total_packets = csi_matrix.shape[0]
+    if combined_mode:
+        combined_matrix = _build_combined_core_matrix(core_groups)
+        if combined_matrix.size == 0:
+            raise ValueError("No hay datos por core para generar combinación.")
+        total_packets = combined_matrix.shape[0]
         total_packets_sum += total_packets
         packet_rate_real = total_packets / float(duration_seconds)
         window_packets = cwi._round_down_to_ten(packet_rate_real)
         if window_packets <= 0:
-            continue
-        stride_packets = max(1, window_packets // 2)
+            raise ValueError("No se pudo calcular ventana válida para modo combinado.")
+        stride_packets = window_packets if no_overlap else max(1, window_packets // 2)
         total_windows = cwi._window_count(total_packets, window_packets, stride_packets)
         if total_windows <= 0:
-            continue
-
-        packet_numbers_core_global = [pkt.get("csi_packet_number") for pkt in core_pkts]
-        packet_numbers_core_global = [int(pkt) for pkt in packet_numbers_core_global if pkt is not None]
-        if len(packet_numbers_core_global) != total_packets:
-            packet_numbers_core_global = list(range(1, total_packets + 1))
-        packet_numbers_core_local = list(range(1, total_packets + 1))
+            raise ValueError("No hay suficientes paquetes para exportar en modo combinado.")
 
         packet_rate_real_last = packet_rate_real
         window_packets_last = window_packets
         stride_packets_last = stride_packets
         total_windows_sum += total_windows
-
         for window_idx in range(total_windows):
             start = window_idx * stride_packets
             end = start + window_packets
-            window = csi_matrix[start:end, :]
-            # Numeración local (1..N del core) para el nombre del archivo.
-            start_pkt_local = packet_numbers_core_local[start]
-            end_pkt_local = packet_numbers_core_local[end - 1]
-            # Numeración global para lógica de solape con etiquetas.
-            start_pkt_global = packet_numbers_core_global[start]
-            end_pkt_global = packet_numbers_core_global[end - 1]
-
+            window = combined_matrix[start:end, :]
+            start_pkt_local = start + 1
+            end_pkt_local = end
             label_prefix = ""
             if export_with_label_name:
-                label = _best_label_for_window(start_pkt_global, end_pkt_global, labels, core=core)
-                if not label:
+                if auto_label:
+                    resolved_label = auto_label
+                else:
+                    resolved_label = _best_label_for_window(start_pkt_local, end_pkt_local, labels, core=None)
+                if not resolved_label:
                     unlabeled_skipped += 1
                     continue
-                safe_label = re.sub(r"[^A-Za-z0-9_-]+", "_", label).strip("_") or "unlabeled"
+                safe_label = re.sub(r"[^A-Za-z0-9_-]+", "_", resolved_label).strip("_") or "unlabeled"
                 label_prefix = f"{safe_label}."
-
-            if generate_rgb:
-                image_name_rgb = (
-                    f"{label_prefix}img_{window_idx + 1:06d}_pkts_{start_pkt_local:06d}_{end_pkt_local:06d}.png"
-                )
-                out_file_rgb = rgb_dirs[core] / image_name_rgb
-                cwi._save_window_image(window, out_file_rgb, normalize=True, cmap="jet")
-            if generate_gray:
-                image_name_gray = (
-                    f"{label_prefix}img_{window_idx + 1:06d}_pkts_{start_pkt_local:06d}_{end_pkt_local:06d}_gray.png"
-                )
-                out_file_gray = gray_dirs[core] / image_name_gray
-                cwi._save_window_image_gray(window, out_file_gray, normalize=True)
+            image_name_rgb = (
+                f"{label_prefix}img_{window_idx + 1:06d}_pkts_{start_pkt_local:06d}_{end_pkt_local:06d}.png"
+            )
+            out_file_rgb = rgb_dirs["combined"] / image_name_rgb
+            cwi._save_window_image(window, out_file_rgb, normalize=True, cmap="jet")
             if export_with_label_name:
                 labeled_generated += 1
+    else:
+        processing_cores = core_ids
+        for core in processing_cores:
+            core_vectors = core_groups.get(core, [])
+            core_pkts = core_packets.get(core, [])
+            if not core_vectors:
+                continue
+
+            csi_matrix = cwi._build_csi_matrix(core_vectors)
+            total_packets = csi_matrix.shape[0]
+            total_packets_sum += total_packets
+            packet_rate_real = total_packets / float(duration_seconds)
+            window_packets = cwi._round_down_to_ten(packet_rate_real)
+            if window_packets <= 0:
+                continue
+            stride_packets = window_packets if no_overlap else max(1, window_packets // 2)
+            total_windows = cwi._window_count(total_packets, window_packets, stride_packets)
+            if total_windows <= 0:
+                continue
+
+            packet_numbers_core_global = [pkt.get("csi_packet_number") for pkt in core_pkts]
+            packet_numbers_core_global = [int(pkt) for pkt in packet_numbers_core_global if pkt is not None]
+            if len(packet_numbers_core_global) != total_packets:
+                packet_numbers_core_global = list(range(1, total_packets + 1))
+            packet_numbers_core_local = list(range(1, total_packets + 1))
+
+            packet_rate_real_last = packet_rate_real
+            window_packets_last = window_packets
+            stride_packets_last = stride_packets
+            total_windows_sum += total_windows
+
+            for window_idx in range(total_windows):
+                start = window_idx * stride_packets
+                end = start + window_packets
+                window = csi_matrix[start:end, :]
+                # Numeración local (1..N del core) para el nombre del archivo.
+                start_pkt_local = packet_numbers_core_local[start]
+                end_pkt_local = packet_numbers_core_local[end - 1]
+                # Numeración global para lógica de solape con etiquetas.
+                start_pkt_global = packet_numbers_core_global[start]
+                end_pkt_global = packet_numbers_core_global[end - 1]
+
+                label_prefix = ""
+                if export_with_label_name:
+                    if auto_label:
+                        resolved_label = auto_label
+                    else:
+                        resolved_label = _best_label_for_window(start_pkt_global, end_pkt_global, labels, core=core)
+                    if not resolved_label:
+                        unlabeled_skipped += 1
+                        continue
+                    safe_label = re.sub(r"[^A-Za-z0-9_-]+", "_", resolved_label).strip("_") or "unlabeled"
+                    label_prefix = f"{safe_label}."
+
+                if generate_rgb:
+                    image_name_rgb = (
+                        f"{label_prefix}img_{window_idx + 1:06d}_pkts_{start_pkt_local:06d}_{end_pkt_local:06d}.png"
+                    )
+                    out_file_rgb = rgb_dirs[core] / image_name_rgb
+                    cwi._save_window_image(window, out_file_rgb, normalize=True, cmap="jet")
+                if export_with_label_name:
+                    labeled_generated += 1
 
     return {
         "status": "ok",
         "out_dir": str(out_dir),
         "rgb_dir": str(next(iter(rgb_dirs.values()))) if generate_rgb else None,
-        "gray_dir": str(next(iter(gray_dirs.values()))) if generate_gray else None,
+        "gray_dir": None,
         "windows_generated": int(total_windows_sum),
         "window_packets": int(window_packets_last) if window_packets_last else None,
         "stride_packets": int(stride_packets_last) if stride_packets_last else None,
@@ -428,12 +509,18 @@ def export_window_images(
         "csi_packets_valid": int(total_packets_sum),
         "bw_fallback_mhz": int(bw),
         "export_with_label_name": bool(export_with_label_name),
+        "combined": bool(combined_mode),
+        "auto_label": auto_label,
         "labeled_windows_generated": int(labeled_generated if export_with_label_name else total_windows_sum),
         "unlabeled_windows_skipped": int(unlabeled_skipped if export_with_label_name else 0),
     }
 
 
-def build_preview_png(pcap_path: Path, packet_range: str, bw_fallback: int) -> bytes:
+def build_preview_png(
+    pcap_path: Path,
+    packet_range: str,
+    bw_fallback: int,
+) -> bytes:
     try:
         packet_start, packet_end = cm._parse_packet_range_spec(packet_range)
     except ValueError as exc:
@@ -447,7 +534,6 @@ def build_preview_png(pcap_path: Path, packet_range: str, bw_fallback: int) -> b
     )
     csi_vectors = result["csi_vectors"]
     core_groups = result["core_groups"]
-    core_packets = result["core_packets"]
 
     if not csi_vectors:
         raise ValueError("Sin paquetes CSI válidos (bcm4366c0) para visualizar.")
@@ -499,7 +585,11 @@ def build_preview_png(pcap_path: Path, packet_range: str, bw_fallback: int) -> b
     return buf.getvalue()
 
 
-def build_preview_plot_data(pcap_path: Path, packet_range: str, bw_fallback: int) -> dict:
+def build_preview_png_combined(
+    pcap_path: Path,
+    packet_range: str,
+    bw_fallback: int,
+) -> bytes:
     try:
         packet_start, packet_end = cm._parse_packet_range_spec(packet_range)
     except ValueError as exc:
@@ -512,7 +602,43 @@ def build_preview_plot_data(pcap_path: Path, packet_range: str, bw_fallback: int
         bw_fallback,
     )
     core_groups = result["core_groups"]
-    core_packets = result["core_packets"]
+    combined = _build_combined_core_matrix(core_groups)
+    if combined.size == 0:
+        raise ValueError("Sin datos por core para visualización combinada.")
+
+    fig, ax = plt.subplots(nrows=1, ncols=1, figsize=(8, 5), squeeze=False)
+    cm._plot_heatmap(
+        combined,
+        title="Amplitude Heatmap — Combined",
+        ax=ax[0][0],
+        packet_numbers=None,
+    )
+    fig.suptitle("Mapa de calor combinado", fontsize=14)
+    fig.tight_layout()
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", dpi=100)
+    plt.close(fig)
+    buf.seek(0)
+    return buf.getvalue()
+
+
+def build_preview_plot_data(
+    pcap_path: Path,
+    packet_range: str,
+    bw_fallback: int,
+) -> dict:
+    try:
+        packet_start, packet_end = cm._parse_packet_range_spec(packet_range)
+    except ValueError as exc:
+        raise ValueError(str(exc)) from exc
+
+    result = cm._collect_csi_packets_interval(
+        str(pcap_path),
+        packet_start,
+        packet_end,
+        bw_fallback,
+    )
+    core_groups = result["core_groups"]
 
     core_items = [
         (core, core_groups[core])
@@ -558,7 +684,11 @@ def api_preview(body: PreviewBody) -> Response:
         bw = resolve_bw_fallback_mhz(
             _logical_pcap_name(pcap_path, body.mode, body.file_id),
         )
-        png = build_preview_png(pcap_path, body.packet_range, bw)
+        png = (
+            build_preview_png_combined(pcap_path, body.packet_range, bw)
+            if body.combined
+            else build_preview_png(pcap_path, body.packet_range, bw)
+        )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:
@@ -577,6 +707,33 @@ def api_preview_data(body: PreviewBody) -> dict:
     try:
         pcap_path = _resolve_pcap_for_preview(body)
         bw = resolve_bw_fallback_mhz(_logical_pcap_name(pcap_path, body.mode, body.file_id))
+        if body.combined:
+            result = cm._collect_csi_packets_interval(
+                str(pcap_path),
+                *cm._parse_packet_range_spec(body.packet_range),
+                bw,
+            )
+            core_groups = result["core_groups"]
+            combined = _build_combined_core_matrix(core_groups)
+            if combined.size == 0:
+                raise ValueError("Sin datos por core para visualización combinada.")
+            mag, subcarrier_axis = cm._prepare_magnitude_for_plot(combined)
+            row_max = np.max(mag, axis=1, keepdims=True)
+            row_max[row_max == 0.0] = 1.0
+            mag = mag / row_max
+            x_positions = list(range(1, combined.shape[0] + 1))
+            return {
+                "cores": {
+                    "combined": {
+                        "x": x_positions,
+                        "y": subcarrier_axis.astype(int).tolist(),
+                        "z": np.round(mag.T, 6).tolist(),
+                        "x_tickvals": x_positions,
+                        "x_ticktext": [str(x) for x in x_positions],
+                        "num_packets": combined.shape[0],
+                    }
+                }
+            }
         return build_preview_plot_data(pcap_path, body.packet_range, bw)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -594,8 +751,10 @@ class FilePickBody(BaseModel):
 class ExportBody(FilePickBody):
     generate_rgb: bool = Field(default=True)
     generate_gray: bool = Field(default=False)
+    no_overlap: bool = Field(default=False)
     regenerate_existing: bool = Field(default=False)
     export_with_label_name: bool = Field(default=False)
+    combined: bool = Field(default=False)
 
 
 class LabelsLoadBody(BaseModel):
@@ -617,7 +776,7 @@ class LabelsSaveBody(LabelsLoadBody):
 
 class LabelsEdgeImpulseBody(LabelsLoadBody):
     include_rgb: bool = Field(default=True)
-    include_gray: bool = Field(default=True)
+    include_gray: bool = Field(default=False)
 
 
 class PythonPreviewBody(PreviewBody):
@@ -657,8 +816,10 @@ def api_export_windows(body: ExportBody) -> dict:
             logical_name,
             generate_rgb=body.generate_rgb,
             generate_gray=body.generate_gray,
+            no_overlap=body.no_overlap,
             regenerate_existing=body.regenerate_existing,
             export_with_label_name=body.export_with_label_name,
+            combined=body.combined,
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -709,8 +870,8 @@ def api_labels_save(body: LabelsSaveBody) -> dict:
 @app.post("/api/labels/export-edge-impulse")
 def api_labels_export_edge_impulse(body: LabelsEdgeImpulseBody) -> dict:
     try:
-        if not body.include_rgb and not body.include_gray:
-            raise ValueError("Selecciona al menos un formato de imagen (RGB o Gray).")
+        if not body.include_rgb:
+            raise ValueError("Solo se admite exportación RGB.")
         pcap_path = _resolve_pcap_common(body.mode, body.browse_relative_path, body.file_id)
         logical_name = _logical_pcap_name(pcap_path, body.mode, body.file_id)
         labels = _load_labels(pcap_path, logical_name)
@@ -718,13 +879,9 @@ def api_labels_export_edge_impulse(body: LabelsEdgeImpulseBody) -> dict:
             raise ValueError("No hay etiquetas guardadas para este fichero.")
 
         out_dir = pcap_path.parent / Path(logical_name).stem
-        rgb_dir = out_dir / "rgb"
-        gray_dir = out_dir / "gray"
         image_paths: list[Path] = []
-        if body.include_rgb and rgb_dir.exists():
-            image_paths.extend(sorted(rgb_dir.glob("*.png")))
-        if body.include_gray and gray_dir.exists():
-            image_paths.extend(sorted(gray_dir.glob("*.png")))
+        if body.include_rgb and out_dir.exists():
+            image_paths.extend(sorted(out_dir.rglob("*.png")))
         if not image_paths:
             raise ValueError("No se encontraron imágenes exportadas para generar el CSV.")
 
@@ -763,45 +920,57 @@ def api_labels_export_edge_impulse(body: LabelsEdgeImpulseBody) -> dict:
 @app.post("/api/preview-python")
 def api_preview_python(body: PythonPreviewBody) -> dict:
     """Abre una ventana interactiva de Matplotlib (local) como en csireader_master.py."""
-    global PYTHON_PREVIEW_PROCESS
+    global PYTHON_PREVIEW_PROCESSES
     try:
-        # Si hay una representación abierta, obligamos a cerrarla antes de lanzar otra.
-        if PYTHON_PREVIEW_PROCESS is not None and PYTHON_PREVIEW_PROCESS.poll() is None:
-            raise HTTPException(
-                status_code=409,
-                detail=(
-                    "Ya hay una representación abierta en Python. "
-                    "Ciérrala para poder representar otro intervalo."
-                ),
-            )
-
         pcap_path = _resolve_pcap_for_preview(body)
         logical_name = _logical_pcap_name(pcap_path, body.mode, body.file_id)
+        requested_meta = {
+            "pcap_path": str(pcap_path),
+            "packet_range": body.packet_range or "",
+            "combined": bool(body.combined),
+        }
+        # Limpia procesos cerrados y evita duplicar exactamente la misma vista.
+        alive: list[dict] = []
+        for item in PYTHON_PREVIEW_PROCESSES:
+            proc = item.get("process")
+            if proc is not None and proc.poll() is None:
+                alive.append(item)
+        PYTHON_PREVIEW_PROCESSES = alive
+        for item in PYTHON_PREVIEW_PROCESSES:
+            if item.get("meta") == requested_meta:
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"Aviso: la vista previa de '{logical_name}' ya está abierta.",
+                )
+
         bw = resolve_bw_fallback_mhz(logical_name)
         script_path = Path(__file__).resolve().parent / "python_preview_window.py"
 
         env = os.environ.copy()
         # Evita que un backend no interactivo heredado impida abrir la ventana.
         env.pop("MPLBACKEND", None)
+        cmd = [
+            sys.executable,
+            str(script_path),
+            "--pcap",
+            str(pcap_path),
+            "--packet-range",
+            body.packet_range or "",
+            "--bw-fallback",
+            str(int(bw)),
+            "--combined",
+            "1" if body.combined else "0",
+        ]
         with PYTHON_PREVIEW_LOG.open("w", encoding="utf-8") as logf:
-            PYTHON_PREVIEW_PROCESS = subprocess.Popen(
-            [
-                sys.executable,
-                str(script_path),
-                "--pcap",
-                str(pcap_path),
-                "--packet-range",
-                body.packet_range or "",
-                "--bw-fallback",
-                str(int(bw)),
-            ],
-            cwd=str(_MATLAB_DIR),
-            stdout=logf,
-            stderr=logf,
-            env=env,
-        )
+            proc = subprocess.Popen(
+                cmd,
+                cwd=str(_MATLAB_DIR),
+                stdout=logf,
+                stderr=logf,
+                env=env,
+            )
         time.sleep(0.35)
-        rc = PYTHON_PREVIEW_PROCESS.poll()
+        rc = proc.poll()
         if rc is not None and rc != 0:
             detail = "No se pudo abrir la ventana Python."
             try:
@@ -811,13 +980,14 @@ def api_preview_python(body: PythonPreviewBody) -> dict:
             except Exception:
                 pass
             raise HTTPException(status_code=500, detail=detail)
+        PYTHON_PREVIEW_PROCESSES.append({"process": proc, "meta": requested_meta})
         return {
             "status": "started",
             "message": (
                 "Representación abierta en una ventana de Python. "
-                "Para representar otro intervalo, cierra primero la ventana actual."
+                "Puedes abrir más vistas; no se abrirá duplicada la misma."
             ),
-            "pid": int(PYTHON_PREVIEW_PROCESS.pid),
+            "pid": int(proc.pid),
         }
     except HTTPException:
         raise
@@ -830,15 +1000,16 @@ def api_preview_python(body: PythonPreviewBody) -> dict:
 
 @app.get("/api/preview-python-status")
 def api_preview_python_status() -> dict:
-    global PYTHON_PREVIEW_PROCESS
-    if PYTHON_PREVIEW_PROCESS is None:
-        return {"running": False}
-    rc = PYTHON_PREVIEW_PROCESS.poll()
-    if rc is None:
-        return {"running": True, "pid": int(PYTHON_PREVIEW_PROCESS.pid)}
-    # Proceso finalizado: liberar referencia para próximos lanzamientos.
-    PYTHON_PREVIEW_PROCESS = None
-    return {"running": False, "exit_code": int(rc)}
+    global PYTHON_PREVIEW_PROCESSES
+    alive: list[dict] = []
+    pids: list[int] = []
+    for item in PYTHON_PREVIEW_PROCESSES:
+        proc = item.get("process")
+        if proc is not None and proc.poll() is None:
+            alive.append(item)
+            pids.append(int(proc.pid))
+    PYTHON_PREVIEW_PROCESSES = alive
+    return {"running": len(pids) > 0, "running_count": len(pids), "pids": pids}
 
 
 @app.post("/api/file-summary-local")

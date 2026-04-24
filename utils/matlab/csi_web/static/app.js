@@ -9,6 +9,8 @@ let pendingFolderPcap = null;
 let previewPythonPollTimer = null;
 let currentLabels = [];
 let selectedSummary = null;
+/** @type {{ path: string, selected: boolean }[]} */
+let selectedBrowsePcaps = [];
 
 /** @type {{ kind: "json", body: object } | { kind: "local", file: File } | null} */
 let summaryContext = null;
@@ -73,12 +75,12 @@ function renderSummaryData(data) {
 
   const durTitle = data.duration_note ? escapeHtmlAttr(data.duration_note) : "";
   const rgbCount = Number(data.export_rgb_count || 0);
-  const grayCount = Number(data.export_gray_count || 0);
+  const combinedCount = Number(data.export_combined_count || 0);
   let exportText = "No";
-  if (rgbCount > 0 || grayCount > 0) {
+  if (rgbCount > 0 || combinedCount > 0) {
     const parts = [];
     if (rgbCount > 0) parts.push(`${rgbCount.toLocaleString()} RGB`);
-    if (grayCount > 0) parts.push(`${grayCount.toLocaleString()} Gray`);
+    if (combinedCount > 0) parts.push(`${combinedCount.toLocaleString()} Combined`);
     exportText = `Sí (${parts.join(" + ")})`;
   }
 
@@ -90,6 +92,19 @@ function renderSummaryData(data) {
       <dt>Paquetes/s</dt><dd>${rateText}</dd>
       <dt>Imágenes exportadas</dt><dd>${exportText}</dd>
     </dl>`;
+
+  // Aviso de etiqueta automática por nombre de fichero.
+  const noticeEl = $("auto-label-notice");
+  if (noticeEl) {
+    const detectedLabel = detectLabelFromFilename(data.file_name || "");
+    if (detectedLabel) {
+      noticeEl.textContent = `✓ Etiqueta automática detectada: "${detectedLabel}" (se asignará a todas las imágenes exportadas de este fichero)`;
+      noticeEl.style.display = "";
+    } else {
+      noticeEl.textContent = "";
+      noticeEl.style.display = "none";
+    }
+  }
 }
 
 async function fetchSummaryJson(body) {
@@ -153,6 +168,13 @@ function showError(msg) {
   el.classList.toggle("hidden", !msg);
 }
 
+function showWarning(msg) {
+  const el = $("warning-msg");
+  if (!el) return;
+  el.textContent = msg || "";
+  el.classList.toggle("hidden", !msg);
+}
+
 function setPreviewStatus(msg) {
   void msg;
 }
@@ -182,6 +204,64 @@ function setPreviewFileName(text) {
   const el = $("preview-file-name");
   if (!el) return;
   el.textContent = text || "";
+}
+
+function renderBrowseSelectedList() {
+  const ul = $("browse-selected-list");
+  if (!ul) return;
+  ul.innerHTML = "";
+  if (selectedBrowsePcaps.length === 0) {
+    const li = document.createElement("li");
+    li.textContent = "Sin ficheros en la lista.";
+    ul.appendChild(li);
+    return;
+  }
+  for (const item of selectedBrowsePcaps) {
+    const li = document.createElement("li");
+    const left = document.createElement("label");
+    left.className = "inline-label";
+    const chk = document.createElement("input");
+    chk.type = "checkbox";
+    chk.checked = Boolean(item.selected);
+    chk.addEventListener("change", () => {
+      item.selected = chk.checked;
+      updateActionButtons();
+    });
+    const txt = document.createElement("span");
+    txt.textContent = item.path;
+    left.appendChild(chk);
+    left.appendChild(txt);
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "secondary";
+    btn.textContent = "Quitar";
+    btn.addEventListener("click", () => {
+      selectedBrowsePcaps = selectedBrowsePcaps.filter((p) => p.path !== item.path);
+      renderBrowseSelectedList();
+      updateActionButtons();
+    });
+    li.appendChild(left);
+    li.appendChild(btn);
+    ul.appendChild(li);
+  }
+}
+
+function addBrowseSelection(rel) {
+  const existing = selectedBrowsePcaps.find((it) => it.path === rel);
+  if (existing) {
+    existing.selected = true;
+  } else {
+    selectedBrowsePcaps.push({ path: rel, selected: true });
+  }
+  renderBrowseSelectedList();
+}
+
+function detectLabelFromFilename(name) {
+  const stem = name.toLowerCase().replace(/\.[^.]+$/, "");
+  for (const label of ["movimiento", "vacio", "quieto"]) {
+    if (stem.includes(label)) return label;
+  }
+  return null;
 }
 
 function stopPreviewPythonPolling() {
@@ -243,16 +323,29 @@ function setLabelsStatus(msg) {
 }
 
 function hasAnyExportFormatSelected() {
-  return Boolean($("export-generate-rgb").checked || $("export-generate-gray").checked);
+  return true; // Exportación fija en RGB.
 }
 
 function hasSelectedFile() {
   try {
-    selectedFileBody();
+    if ($("mode").value === "browse") {
+      selectedPreviewBodies();
+    } else {
+      selectedFileBody();
+    }
     return true;
   } catch {
     return false;
   }
+}
+
+function getPreviewModes() {
+  const regular = Boolean($("preview-regular")?.checked);
+  const combined = Boolean($("preview-combined")?.checked);
+  const modes = [];
+  if (regular) modes.push(false);
+  if (combined) modes.push(true);
+  return modes;
 }
 
 function hasValidSecondsIntervalInput() {
@@ -268,7 +361,7 @@ function hasValidSecondsIntervalInput() {
 function updateActionButtons() {
   const hasFile = hasSelectedFile();
   const hasFormats = hasAnyExportFormatSelected();
-  $("preview-btn").disabled = !hasFile;
+  $("preview-btn").disabled = !hasFile || getPreviewModes().length === 0;
   $("export-btn").disabled = !(hasFile && hasFormats);
   $("add-label-btn").disabled = !(hasFile && selectedSummary && hasValidSecondsIntervalInput());
   $("save-labels-btn").disabled = !(hasFile && currentLabels.length > 0);
@@ -297,6 +390,22 @@ function selectedFileBody() {
     }
   }
   return body;
+}
+
+function selectedPreviewBodies() {
+  const mode = $("mode").value;
+  if (mode !== "browse") {
+    return [selectedFileBody()];
+  }
+  const rels = selectedBrowsePcaps.filter((it) => it.selected).map((it) => it.path);
+  if (!rels.length) {
+    throw new Error("Marca al menos un .pcap en la lista de representaciones.");
+  }
+  return rels.map((rel) => ({
+    mode: "browse",
+    browse_relative_path: rel,
+    file_id: "",
+  }));
 }
 
 function normalizeLabelsForRender(labels) {
@@ -464,16 +573,13 @@ async function saveLabels() {
     if (Boolean($("generate-impulse-labeled-images").checked)) {
       const payload = {
         ...body,
-        generate_rgb: Boolean($("export-generate-rgb").checked),
-        generate_gray: Boolean($("export-generate-gray").checked),
+        generate_rgb: true,
+        generate_gray: false,
+        no_overlap: Boolean($("export-no-overlap").checked),
         regenerate_existing: Boolean($("export-regenerate-existing").checked),
         export_with_label_name: true,
+        combined: Boolean($("preview-combined")?.checked),
       };
-      const hasFormats = payload.generate_rgb || payload.generate_gray;
-      if (!hasFormats) {
-        showError("Selecciona al menos RGB o Gray para generar imágenes con etiquetas.");
-        return false;
-      }
       const res2 = await fetch("/api/export-windows", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -523,6 +629,7 @@ function setModePanels() {
   clearExportStatus();
   resetExportProgress();
   setPreviewFileName("");
+  showWarning("");
   clearLabelsUi();
   $("browse-panel").classList.toggle("hidden", mode !== "browse");
   $("upload-panel").classList.toggle("hidden", mode !== "upload");
@@ -533,6 +640,7 @@ function setModePanels() {
 
 async function loadBrowse(path) {
   showError("");
+  showWarning("");
   const q = path ? `?path=${encodeURIComponent(path)}` : "";
   const res = await fetch(`/api/browse${q}`);
   const data = await res.json().catch(() => ({}));
@@ -575,6 +683,7 @@ async function loadBrowse(path) {
     btn.addEventListener("click", () => {
       const rel = browseRelPath ? `${browseRelPath}/${f}` : f;
       $("browse-relative-path").value = rel;
+      addBrowseSelection(rel);
       summaryContext = {
         kind: "json",
         body: {
@@ -690,12 +799,30 @@ async function doUpload() {
 
 async function doPreview() {
   showError("");
+  showWarning("");
   const packet_range = "";
-  let body;
+  let bodies;
   try {
-    body = { ...selectedFileBody(), packet_range };
-    const pcapName = resolveSelectedPcapName(body);
-    setPreviewFileName(pcapName ? `PCAP representado: ${pcapName}` : "");
+    const modes = getPreviewModes();
+    if (!modes.length) {
+      throw new Error("Marca al menos una opción de vista previa (Regular o Combined).");
+    }
+    bodies = [];
+    for (const base of selectedPreviewBodies()) {
+      for (const combined of modes) {
+        bodies.push({
+          ...base,
+          packet_range,
+          combined,
+        });
+      }
+    }
+    if (bodies.length === 1) {
+      const pcapName = resolveSelectedPcapName(bodies[0]);
+      setPreviewFileName(pcapName ? `PCAP representado: ${pcapName}` : "");
+    } else {
+      setPreviewFileName(`Vistas a representar: ${bodies.length}`);
+    }
   } catch (e) {
     showError(e instanceof Error ? e.message : "Falta seleccionar fichero");
     return;
@@ -703,94 +830,157 @@ async function doPreview() {
 
   $("preview-btn").disabled = true;
   try {
-    const res = await fetch("/api/preview-python", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body),
-    });
-    const data = await res.json().catch(() => ({}));
-    if (!res.ok) {
-      const detail = data.detail;
-      const msg =
-        typeof detail === "string"
-          ? detail
-          : Array.isArray(detail)
-            ? detail.map((d) => d.msg || d).join("; ")
-            : res.statusText;
-      showError(msg || "Error al generar la vista previa");
-      return;
+    const warnings = [];
+    const errors = [];
+    for (const body of bodies) {
+      const res = await fetch("/api/preview-python", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        const detail = data.detail;
+        const msg =
+          typeof detail === "string"
+            ? detail
+            : Array.isArray(detail)
+              ? detail.map((d) => d.msg || d).join("; ")
+              : res.statusText;
+        if (res.status === 409) {
+          warnings.push(msg || `Vista ya abierta: ${body.browse_relative_path || "archivo"}`);
+          continue;
+        }
+        errors.push(msg || `Error en ${body.browse_relative_path || "archivo"}`);
+      }
     }
-    startPreviewPythonPolling();
+    if (warnings.length) {
+      showWarning(warnings.join(" | "));
+    }
+    if (errors.length) {
+      showError(errors.join(" | "));
+    } else {
+      startPreviewPythonPolling();
+    }
   } finally {
     $("preview-btn").disabled = false;
   }
+}
+
+function _selectedExportBodies() {
+  const mode = $("mode").value;
+  if (mode === "browse") {
+    const rels = selectedBrowsePcaps.filter((it) => it.selected).map((it) => it.path);
+    if (rels.length > 0) {
+      return rels.map((rel) => ({ mode: "browse", browse_relative_path: rel, file_id: "" }));
+    }
+  }
+  // Fallback: fichero único activo (modo upload o browse sin lista marcada).
+  return [selectedFileBody()];
 }
 
 async function doExportWindows() {
   showError("");
   const status = $("export-status");
   if (status) status.classList.add("hidden");
-  const rgb = Boolean($("export-generate-rgb").checked);
-  const grayChecked = Boolean($("export-generate-gray").checked);
-  if (!rgb && !grayChecked) {
-    showError("Selecciona al menos una opción de exportación: color o blanco y negro.");
-    setExportProgress(100, "Error", true);
-    return;
-  }
-  let body;
+
+  let bodies;
   try {
-    body = selectedFileBody();
+    bodies = _selectedExportBodies();
   } catch (e) {
     showError(e instanceof Error ? e.message : "Falta seleccionar fichero");
     setExportProgress(100, "Error", true);
     return;
   }
-  const payload = {
-    ...body,
-    generate_rgb: rgb,
-    generate_gray: grayChecked,
+
+  const sharedOpts = {
+    generate_rgb: true,
+    generate_gray: false,
+    no_overlap: Boolean($("export-no-overlap").checked),
     regenerate_existing: Boolean($("export-regenerate-existing").checked),
-    export_with_label_name: false,
+    export_with_label_name: Boolean($("generate-impulse-labeled-images").checked),
+    combined: Boolean($("preview-combined")?.checked),
   };
+
   $("export-btn").disabled = true;
-  status.textContent = "";
+  if (status) status.textContent = "";
+
+  const results = [];
+  const errors = [];
+
   try {
-    setExportProgress(65, "Guardando imágenes…");
-    const res = await fetch("/api/export-windows", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(payload),
-    });
-    const data = await res.json().catch(() => ({}));
-    if (!res.ok) {
-      const detail = data.detail;
-      const msg =
-        typeof detail === "string"
-          ? detail
-          : Array.isArray(detail)
-            ? detail.map((d) => d.msg || d).join("; ")
-            : res.statusText;
-      showError(msg || "Error exportando imágenes");
-      status.textContent = "";
-      setExportProgress(100, "Error", true);
-      return;
+    for (let i = 0; i < bodies.length; i++) {
+      const body = bodies[i];
+      const label = body.browse_relative_path
+        ? body.browse_relative_path.split("/").pop()
+        : `fichero ${i + 1}`;
+      setExportProgress(
+        Math.round(10 + (80 * i) / bodies.length),
+        bodies.length > 1 ? `Exportando ${i + 1}/${bodies.length}: ${label}…` : "Guardando imágenes…"
+      );
+
+      const payload = { ...body, ...sharedOpts };
+      const res = await fetch("/api/export-windows", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+      const data = await res.json().catch(() => ({}));
+
+      if (!res.ok) {
+        const detail = data.detail;
+        const msg =
+          typeof detail === "string"
+            ? detail
+            : Array.isArray(detail)
+              ? detail.map((d) => d.msg || d).join("; ")
+              : res.statusText;
+        errors.push(`${label}: ${msg || "Error exportando"}`);
+        continue;
+      }
+
+      if (data.status === "skipped_existing") {
+        errors.push(`${label}: ya existen imágenes (activa "Regenerar" para sobrescribir)`);
+        continue;
+      }
+
+      results.push({ label, data, payload });
     }
-    if (data.status === "skipped_existing") {
-      status.textContent = "Ya existen imágenes generadas. Activa \"Regenerar\" si quieres sobrescribir.";
-      if (status) status.classList.remove("hidden");
-      setExportProgress(100, "✔️ Finalizado");
-      return;
-    }
-    const rgbTxt = data.rgb_dir ? "RGB" : "";
-    const grayTxt = data.gray_dir ? (rgbTxt ? " + Gray" : "Gray") : "";
-    const coresTxt =
-      data.cores_detected != null ? ` (cores detectados: ${Number(data.cores_detected)})` : "";
-    status.textContent = `Exportación completada: ${data.windows_generated} imágenes ${rgbTxt}${grayTxt}.${coresTxt}`;
-    if (status) status.classList.remove("hidden");
-    setExportProgress(100, "✔️ Finalizado");
   } finally {
     updateExportButtonState();
   }
+
+  if (errors.length > 0 && results.length === 0) {
+    showError(errors.join("\n"));
+    setExportProgress(100, "Error", true);
+    return;
+  }
+
+  // Construir mensaje de resumen.
+  const lines = results.map(({ label, data, payload }) => {
+    const modeTxt = payload.combined ? " combinado" : "";
+    const labeledMode = Boolean(payload.export_with_label_name);
+    const exportedCount = labeledMode
+      ? Number(data.labeled_windows_generated ?? data.windows_generated ?? 0)
+      : Number(data.windows_generated ?? 0);
+    const autoLabelTxt = data.auto_label ? ` [${data.auto_label}]` : "";
+    const skippedTxt =
+      labeledMode && Number(data.unlabeled_windows_skipped || 0) > 0
+        ? ` (descartadas sin etiqueta: ${Number(data.unlabeled_windows_skipped)})`
+        : "";
+    const prefix = bodies.length > 1 ? `${label}: ` : "";
+    return `${prefix}${exportedCount} imágenes RGB${modeTxt}${autoLabelTxt}${skippedTxt}`;
+  });
+
+  if (errors.length > 0) {
+    lines.push(...errors.map((e) => `⚠ ${e}`));
+  }
+
+  if (status) {
+    status.textContent = lines.join(" | ");
+    status.classList.remove("hidden");
+  }
+  setExportProgress(100, "✔️ Finalizado");
 }
 
 $("mode").addEventListener("change", setModePanels);
@@ -806,14 +996,11 @@ $("add-label-btn").addEventListener("click", addLabelFromInputs);
 $("save-labels-btn").addEventListener("click", () => {
   void saveLabels();
 });
-["export-generate-rgb", "export-generate-gray"].forEach((id) => {
-  $(id).addEventListener("change", updateExportButtonState);
-});
 ["label-start-sec", "label-end-sec", "label-name", "label-core"].forEach((id) => {
   $(id).addEventListener("input", updateActionButtons);
   $(id).addEventListener("change", updateActionButtons);
 });
-["browse-relative-path", "generate-impulse-labeled-images"].forEach((id) => {
+["browse-relative-path", "generate-impulse-labeled-images", "preview-regular", "preview-combined"].forEach((id) => {
   $(id).addEventListener("change", updateActionButtons);
 });
 
@@ -821,4 +1008,5 @@ setModePanels();
 syncUploadSubpanels();
 updateExportButtonState();
 renderLabelsList();
+renderBrowseSelectedList();
 loadBrowse("");

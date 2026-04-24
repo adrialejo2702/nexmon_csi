@@ -32,6 +32,10 @@
           <ul class="list" id="browse-list"></ul>
           <label>PCAP seleccionado (relativo a GOLD_DISK)</label>
           <input type="text" id="browse-relative-path" readonly placeholder="Elige un .pcap de la lista" />
+          <div style="margin-top:0.75rem">
+            <label>Lista de representaciones</label>
+            <ul class="list" id="browse-selected-list"></ul>
+          </div>
         </div>
 
         <div id="upload-panel" class="mode-fields hidden">
@@ -78,25 +82,32 @@
             <option value="3">Core 3</option>
           </select>
           <button type="button" class="secondary" id="add-label-btn">Añadir</button>
-          <button type="button" class="secondary" id="save-labels-btn">Guardar etiquetas</button>
         </div>
         <ul class="list labels-list" id="labels-list"></ul>
         <div class="row" style="margin-top:0.6rem">
+          <button type="button" class="secondary" id="save-labels-btn">Guardar etiquetas</button>
+        </div>
+        <div class="row" style="margin-top:0.6rem">
           <label class="inline-label"><input type="checkbox" id="generate-impulse-labeled-images" /> Generar imágenes con etiquetas Edge Impulse</label>
         </div>
+        <p class="sub" id="auto-label-notice" style="display:none;color:#2a7;font-weight:600"></p>
         <p class="sub" id="labels-status"></p>
       </section>
       </div>
 
       <section class="panel panel--preview">
         <h2>Vista previa</h2>
+        <label class="inline-label"><input type="checkbox" id="preview-regular" checked /> Generar vista previa (normal)</label>
+        <label class="inline-label"><input type="checkbox" id="preview-combined" /> Generar vista previa combinada (los cuatro cores superpuestos)</label>
         <button type="button" id="preview-btn">Generar vista previa</button>
         <p class="sub" id="preview-file-name"></p>
+        <div class="sub hidden" id="warning-msg"></div>
+        <div id="preview-multi-results"></div>
         <div class="export-box">
-          <label class="inline-label"><input type="checkbox" id="export-generate-rgb" checked /> Exportar en color (RGB)</label>
-          <label class="inline-label"><input type="checkbox" id="export-generate-gray" /> Exportar en blanco y negro (Gray)</label>
+          <p class="sub">Exportación en color (RGB) activada por defecto.</p>
+          <label class="inline-label"><input type="checkbox" id="export-no-overlap" /> Exportar 1s sin solapamiento</label>
           <label class="inline-label"><input type="checkbox" id="export-regenerate-existing" /> Regenerar si ya existen imágenes</label>
-          <button type="button" id="export-btn" class="secondary">Exportar imágenes (1s, solape 0.5s)</button>
+          <button type="button" id="export-btn" class="secondary">Exportar imágenes</button>
           <div id="export-progress" class="export-progress hidden" aria-live="polite">
             <div class="export-progress__bar">
               <div id="export-progress-fill" class="export-progress__fill"></div>

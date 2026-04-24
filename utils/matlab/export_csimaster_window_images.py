@@ -16,10 +16,48 @@ from pathlib import Path
 
 import matplotlib
 import numpy as np
+import csireader_master as cm
 
 # Backend no interactivo para exportar PNG sin abrir ventanas.
 matplotlib.use("Agg", force=True)
 import matplotlib.pyplot as plt  # noqa: E402
+
+TARGET_WIDTH_PX = 85
+TARGET_HEIGHT_PX = 50
+
+
+def _resample_width(data_hw: np.ndarray, target_width: int) -> np.ndarray:
+    """Reescala solo el eje temporal (ancho) conservando la altura."""
+    if data_hw.ndim != 2:
+        raise ValueError("Se esperaba matriz 2D para reescalar ancho.")
+    h, w = data_hw.shape
+    if w == target_width:
+        return data_hw
+    if w <= 1:
+        return np.repeat(data_hw, target_width, axis=1)
+    x_old = np.linspace(0.0, 1.0, w)
+    x_new = np.linspace(0.0, 1.0, target_width)
+    out = np.zeros((h, target_width), dtype=np.float64)
+    for i in range(h):
+        out[i, :] = np.interp(x_new, x_old, data_hw[i, :])
+    return out
+
+
+def _resample_height(data_hw: np.ndarray, target_height: int) -> np.ndarray:
+    """Reescala solo el eje de subportadoras (alto) conservando el ancho."""
+    if data_hw.ndim != 2:
+        raise ValueError("Se esperaba matriz 2D para reescalar alto.")
+    h, w = data_hw.shape
+    if h == target_height:
+        return data_hw
+    if h <= 1:
+        return np.repeat(data_hw, target_height, axis=0)
+    y_old = np.linspace(0.0, 1.0, h)
+    y_new = np.linspace(0.0, 1.0, target_height)
+    out = np.zeros((target_height, w), dtype=np.float64)
+    for j in range(w):
+        out[:, j] = np.interp(y_new, y_old, data_hw[:, j])
+    return out
 
 
 def _resolve_pcap_path(base_dir: Path, user_input: str) -> Path:
@@ -95,21 +133,19 @@ def _save_window_image(
     normalize: bool,
     cmap: str,
 ) -> None:
-    shifted = np.fft.fftshift(window_csi, axes=1)
-    magnitude = np.abs(shifted)
+    # Misma selección de subportadoras válidas que en el preview principal.
+    magnitude, _subcarrier_axis = cm._prepare_magnitude_for_plot(window_csi)
+    magnitude_hw = magnitude.T  # [subportadoras, tiempo]
+    magnitude_hw = _resample_height(magnitude_hw, TARGET_HEIGHT_PX)
+    magnitude_hw = _resample_width(magnitude_hw, TARGET_WIDTH_PX)
 
     if normalize:
-        max_value = float(np.max(magnitude))
+        max_value = float(np.max(magnitude_hw))
         if max_value > 0.0:
-            magnitude = magnitude / max_value
+            magnitude_hw = magnitude_hw / max_value
 
-    # Imagen "limpia" para red neuronal (sin ejes, títulos ni colorbar).
-    plt.figure(figsize=(4, 4), dpi=100)
-    plt.imshow(magnitude.T, aspect="auto", cmap=cmap, interpolation="nearest")
-    plt.axis("off")
-    plt.tight_layout(pad=0)
-    plt.savefig(out_file, dpi=100, bbox_inches="tight", pad_inches=0)
-    plt.close()
+    # Guarda PNG con tamaño exacto: alto=subportadoras usadas, ancho=85 px.
+    plt.imsave(out_file, magnitude_hw, cmap=cmap, vmin=0.0, vmax=1.0, format="png")
 
 
 def _save_window_image_gray(
@@ -118,21 +154,18 @@ def _save_window_image_gray(
     *,
     normalize: bool,
 ) -> None:
-    shifted = np.fft.fftshift(window_csi, axes=1)
-    magnitude = np.abs(shifted)
+    magnitude, _subcarrier_axis = cm._prepare_magnitude_for_plot(window_csi)
+    magnitude_hw = magnitude.T
+    magnitude_hw = _resample_height(magnitude_hw, TARGET_HEIGHT_PX)
+    magnitude_hw = _resample_width(magnitude_hw, TARGET_WIDTH_PX)
 
     if normalize:
-        max_value = float(np.max(magnitude))
+        max_value = float(np.max(magnitude_hw))
         if max_value > 0.0:
-            magnitude = magnitude / max_value
+            magnitude_hw = magnitude_hw / max_value
 
-    gray = np.clip(magnitude * 255.0, 0.0, 255.0).astype(np.uint8)
-    plt.figure(figsize=(4, 4), dpi=100)
-    plt.imshow(gray.T, aspect="auto", cmap="gray", interpolation="nearest", vmin=0, vmax=255)
-    plt.axis("off")
-    plt.tight_layout(pad=0)
-    plt.savefig(out_file, dpi=100, bbox_inches="tight", pad_inches=0)
-    plt.close()
+    gray = np.clip(magnitude_hw * 255.0, 0.0, 255.0).astype(np.uint8)
+    plt.imsave(out_file, gray, cmap="gray", vmin=0, vmax=255, format="png")
 
 
 def main() -> int:
