@@ -67,7 +67,7 @@ logger = logging.getLogger(__name__)
 
 # Tras subir, el .pcap en disco es ``{uuid}.pcap``; guardamos el nombre original para BW y etiquetas.
 UPLOAD_ORIGINAL_NAMES: dict[str, str] = {}
-ALLOWED_LABELS = {"movimiento", "vacio", "quieto"}
+ALLOWED_LABELS = {"movimiento", "vacio", "presencia"}
 PYTHON_PREVIEW_PROCESSES: list[dict] = []
 
 MAX_UPLOAD_BYTES = 500 * 1024 * 1024  # 500 MiB
@@ -291,7 +291,7 @@ def _build_combined_core_matrix(core_groups: dict[int, list[np.ndarray]]) -> np.
 def _detect_label_from_filename(name: str) -> str | None:
     """Detecta etiqueta automáticamente desde el nombre del fichero."""
     stem = Path(name).stem.lower()
-    for label in ("movimiento", "vacio", "quieto"):
+    for label in ("movimiento", "vacio"):
         if label in stem:
             return label
     return None
@@ -323,7 +323,8 @@ def export_window_images(
     base_stem = Path(logical_name).stem
     out_stem = f"{base_stem}_edge_impulse" if export_with_label_name else base_stem
     overlap_dir = "ov0" if no_overlap else "ov50"
-    out_dir = pcap_path.parent / out_stem / overlap_dir
+    out_root = pcap_path.parent
+    out_dir = out_root / out_stem / overlap_dir
     labels: list[dict] = []
     if export_with_label_name and not auto_label:
         labels = _load_labels(pcap_path, logical_name)
@@ -764,7 +765,7 @@ class LabelsLoadBody(BaseModel):
 
 
 class LabelItem(BaseModel):
-    label: Literal["movimiento", "vacio", "quieto"]
+    label: Literal["movimiento", "vacio", "presencia"]
     start_packet: int = Field(ge=1)
     end_packet: int = Field(ge=1)
     core: str = Field(default="all")

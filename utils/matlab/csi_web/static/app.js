@@ -258,7 +258,7 @@ function addBrowseSelection(rel) {
 
 function detectLabelFromFilename(name) {
   const stem = name.toLowerCase().replace(/\.[^.]+$/, "");
-  for (const label of ["movimiento", "vacio", "quieto"]) {
+  for (const label of ["movimiento", "vacio"]) {
     if (stem.includes(label)) return label;
   }
   return null;
@@ -652,8 +652,12 @@ async function loadBrowse(path) {
   $("browse-path").textContent = browseRelPath || "(raíz)";
   const ul = $("browse-list");
   ul.innerHTML = "";
+  const dateDirPattern = /^2026\d{4}$/;
+  const visibleDirectories = (data.directories || []).filter((d) =>
+    dateDirPattern.test(String(d)),
+  );
 
-  for (const d of data.directories || []) {
+  for (const d of visibleDirectories) {
     const li = document.createElement("li");
     const span = document.createElement("span");
     span.className = "name";
