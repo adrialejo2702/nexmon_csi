@@ -1,0 +1,237 @@
+<!doctype html>
+<html lang="es">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Edge Impulse — Comparativa por antena</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}" />
+  </head>
+  <body>
+    <main class="container">
+
+      <div class="page-header">
+        <h1>Comparativa de clasificación por antena</h1>
+        <p>Selecciona experimento, carpeta del experimento y carpeta OV para lanzar la clasificación por core0&thinsp;…&thinsp;core3.</p>
+      </div>
+
+      {% if error %}
+      <div class="alert error">{{ error }}</div>
+      {% endif %}
+
+      <!-- Estado del job en curso -->
+      {% if job_status and job_status.status not in ("completed", "error", "cancelled") %}
+      <section class="card" id="job-status-card" data-job-id="{{ job_id }}">
+        <h2>Estado de clasificación</h2>
+        <p>
+          Estado: <span class="status-badge status-running" id="job-state">{{ job_status.status }}</span>
+          &nbsp;&nbsp;
+          <span id="job-progress">{{ job_status.progress.done }} / {{ job_status.progress.total }}</span> imágenes
+        </p>
+        <div class="progress-wrap">
+          <div class="progress-bar" id="job-progress-bar" style="width:0%"></div>
+        </div>
+        <div class="table-wrap" style="margin-bottom:14px">
+          <table>
+            <thead>
+              <tr><th>Core</th><th>Progreso</th></tr>
+            </thead>
+            <tbody>
+              {% for core, p in job_status.core_progress.items() %}
+              <tr>
+                <td>{{ core }}</td>
+                <td id="core-{{ core }}">{{ p.done }} / {{ p.total }}</td>
+              </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        </div>
+        <button type="button" id="cancel-job-btn" class="btn btn-danger">Cancelar test</button>
+      </section>
+      {% endif %}
+
+      <!-- Formulario de selección -->
+      <section class="card">
+        <h2>Configuración de ejecución</h2>
+        <form action="{{ url_for('run_batch') }}" method="post">
+          <div class="grid">
+            <label>
+              Experimento
+              <select name="experiment" required onchange="window.location='/?experiment='+encodeURIComponent(this.value)">
+                {% for exp in experiments %}
+                <option value="{{ exp }}" {% if exp == selected_experiment %}selected{% endif %}>{{ exp }}</option>
+                {% endfor %}
+              </select>
+            </label>
+
+            <label>
+              Carpeta del experimento
+              <select name="selected_folder" required onchange="window.location='/?experiment='+encodeURIComponent(document.querySelector('select[name=experiment]').value)+'&selected_folder='+encodeURIComponent(this.value)">
+                {% for d in experiment_subdirs %}
+                <option value="{{ d }}" {% if d == selected_folder %}selected{% endif %}>{{ d }}</option>
+                {% endfor %}
+              </select>
+            </label>
+
+            <label>
+              Carpeta OV
+              <select name="ov_folder" required>
+                {% for v in ov_folders %}
+                <option value="{{ v }}" {% if v == selected_ov_folder %}selected{% endif %}>{{ v }}</option>
+                {% endfor %}
+              </select>
+            </label>
+
+            <label>
+              Timeout por imagen (s)
+              <input type="number" name="timeout_seconds" value="60" min="5" max="300" />
+            </label>
+          </div>
+          <button type="submit" class="btn btn-primary">Ejecutar clasificación por lote</button>
+        </form>
+      </section>
+
+      <!-- Nota de configuración -->
+      <section class="card">
+        <h2>Proyectos por core</h2>
+        <p class="config-note">Edita <code>config/projects.local.json</code> para asignar <code>projectId</code> y <code>apiKey</code> a cada antena (core0&thinsp;…&thinsp;core3).</p>
+      </section>
+
+      {% if result %}
+
+        {% if result.warnings %}
+        <div class="alert warning">
+          <ul style="margin:0;padding-left:18px">
+            {% for w in result.warnings %}<li>{{ w }}</li>{% endfor %}
+          </ul>
+        </div>
+        {% endif %}
+
+        <!-- Resumen por core -->
+        <section class="card">
+          <h2>Resumen por core</h2>
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>Core</th>
+                  <th>Total imágenes</th>
+                  <th>Clasificadas OK</th>
+                  <th>Accuracy vs etiqueta</th>
+                  <th>Score medio</th>
+                </tr>
+              </thead>
+              <tbody>
+                {% for core, s in result.summary.items() %}
+                <tr>
+                  <td>{{ core }}</td>
+                  <td>{{ s.total_images }}</td>
+                  <td>{{ s.successful_calls }}</td>
+                  <td>{{ "%.3f"|format(s.accuracy_vs_filename_label) }}</td>
+                  <td>{{ "%.3f"|format(s.avg_top_score) }}</td>
+                </tr>
+                {% endfor %}
+              </tbody>
+            </table>
+          </div>
+        </section>
+
+        <!-- Tabla horizontal -->
+        <section class="card">
+          <h2>Clasificación por imagen</h2>
+          <p class="muted" style="margin:0 0 12px;font-size:12px">
+            Mostrando {{ result.horizontal_rows|length }} de {{ result.total_horizontal_rows }} imágenes.
+            {% if result.truncated %}El CSV exportado contiene el total.{% endif %}
+          </p>
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>Imagen</th>
+                  <th>Esperado</th>
+                  <th>core0</th>
+                  <th>core1</th>
+                  <th>core2</th>
+                  <th>core3</th>
+                </tr>
+              </thead>
+              <tbody>
+                {% for row in result.horizontal_rows %}
+                <tr>
+                  <td>{{ row.image_key }}</td>
+                  <td>{{ row.expected_label }}</td>
+                  <td>{{ row.core0_pred or "-" }}</td>
+                  <td>{{ row.core1_pred or "-" }}</td>
+                  <td>{{ row.core2_pred or "-" }}</td>
+                  <td>{{ row.core3_pred or "-" }}</td>
+                </tr>
+                {% endfor %}
+              </tbody>
+            </table>
+          </div>
+        </section>
+
+        <!-- Archivos exportados -->
+        <section class="card">
+          <h2>Archivos exportados</h2>
+          {% if result.output_files %}
+          <ul style="margin:0;padding-left:18px;font-size:13px;line-height:1.8">
+            <li><code>{{ result.output_files.horizontal_csv.split('/')[-1] }}</code></li>
+            <li><code>{{ result.output_files.disagreement_csv.split('/')[-1] }}</code></li>
+            <li><code>{{ result.output_files.detail_csv.split('/')[-1] }}</code></li>
+            <li><code>{{ result.output_files.summary_json.split('/')[-1] }}</code></li>
+          </ul>
+          <p class="muted" style="margin:8px 0 0;font-size:12px">Guardados en <code>outputs/</code></p>
+          {% else %}
+          <p class="muted">No se guardaron archivos (ejecución cancelada).</p>
+          {% endif %}
+        </section>
+
+      {% endif %}
+    </main>
+
+    <!-- Polling de progreso -->
+    {% if job_status and job_status.status not in ("completed", "error", "cancelled") %}
+    <script>
+      (function() {
+        const card = document.getElementById("job-status-card");
+        if (!card) return;
+        const jobId = card.getAttribute("data-job-id");
+        const stateEl = document.getElementById("job-state");
+        const progressEl = document.getElementById("job-progress");
+        const progressBarEl = document.getElementById("job-progress-bar");
+        const cancelBtn = document.getElementById("cancel-job-btn");
+
+        if (cancelBtn) {
+          cancelBtn.addEventListener("click", async () => {
+            cancelBtn.disabled = true;
+            cancelBtn.textContent = "Cancelando…";
+            await fetch(`/cancel/${jobId}`, { method: "POST" });
+          });
+        }
+
+        async function tick() {
+          const res = await fetch(`/status/${jobId}`);
+          if (!res.ok) return;
+          const data = await res.json();
+          stateEl.textContent = data.status;
+          const done = data.progress?.done ?? 0;
+          const total = data.progress?.total ?? 0;
+          progressEl.textContent = `${done} / ${total}`;
+          const pct = total > 0 ? Math.round((done * 100) / total) : 0;
+          progressBarEl.style.width = `${pct}%`;
+          for (const [core, coreData] of Object.entries(data.core_progress || {})) {
+            const el = document.getElementById(`core-${core}`);
+            if (el) el.textContent = `${coreData.done} / ${coreData.total}`;
+          }
+          if (data.status === "completed" || data.status === "error" || data.status === "cancelled") {
+            window.location = `/?experiment=${encodeURIComponent(document.querySelector('select[name=experiment]').value)}&selected_folder=${encodeURIComponent(document.querySelector('select[name=selected_folder]').value)}&ov_folder=${encodeURIComponent(document.querySelector('select[name=ov_folder]').value)}&job_id=${jobId}`;
+            return;
+          }
+          setTimeout(tick, 1500);
+        }
+        setTimeout(tick, 1200);
+      })();
+    </script>
+    {% endif %}
+  </body>
+</html>

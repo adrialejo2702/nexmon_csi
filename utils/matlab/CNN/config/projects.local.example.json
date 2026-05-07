@@ -1,0 +1,22 @@
+{
+  "core0": {
+    "projectId": 111111,
+    "apiKey": "ei_xxxxx",
+    "impulseId": null
+  },
+  "core1": {
+    "projectId": 222222,
+    "apiKey": "ei_xxxxx",
+    "impulseId": null
+  },
+  "core2": {
+    "projectId": 333333,
+    "apiKey": "ei_xxxxx",
+    "impulseId": null
+  },
+  "core3": {
+    "projectId": 444444,
+    "apiKey": "ei_xxxxx",
+    "impulseId": null
+  }
+}
