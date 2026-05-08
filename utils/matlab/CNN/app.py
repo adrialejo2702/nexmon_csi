@@ -89,36 +89,51 @@ def get_run_key(experiment: str, selected_folder: str, ov_folder: str) -> str:
     )
 
 
-def get_output_paths(run_key: str) -> Dict[str, Path]:
+def get_output_paths(run_key: str, experiment: str) -> Dict[str, Path]:
+    out_dir = OUTPUT_DIR / to_safe_token(experiment)
     return {
-        "detail_csv": OUTPUT_DIR / f"{run_key}_detalle_por_core.csv",
-        "horizontal_csv": OUTPUT_DIR / f"{run_key}_comparativa_horizontal.csv",
-        "disagreement_csv": OUTPUT_DIR / f"{run_key}_cores_con_diferencias.csv",
-        "summary_json": OUTPUT_DIR / f"{run_key}_resumen_metricas.json",
+        "detail_csv": out_dir / f"{run_key}_detalle_por_core.csv",
+        "horizontal_csv": out_dir / f"{run_key}_comparativa_horizontal.csv",
+        "disagreement_csv": out_dir / f"{run_key}_cores_con_diferencias.csv",
+        "summary_json": out_dir / f"{run_key}_resumen_metricas.json",
     }
 
 
-def outputs_exist(run_key: str) -> bool:
-    paths = get_output_paths(run_key)
+def outputs_exist(run_key: str, experiment: str) -> bool:
+    paths = get_output_paths(run_key, experiment)
     return all(path.exists() for path in paths.values())
 
 
-def load_existing_result(run_key: str) -> Dict:
-    paths = get_output_paths(run_key)
+def load_existing_result(run_key: str, experiment: str) -> Dict:
+    paths = get_output_paths(run_key, experiment)
     summary_data = json.loads(paths["summary_json"].read_text(encoding="utf-8"))
     horizontal_rows: List[Dict] = []
     with paths["horizontal_csv"].open("r", newline="", encoding="utf-8") as f:
         reader = csv.DictReader(f)
         for row in reader:
             horizontal_rows.append(row)
+    per_core_summary = summary_data.get("summary_per_core", {})
+    # Recompute ensemble votes if columns are missing (old CSVs won't have them)
+    for row in horizontal_rows:
+        if "hard_vote" not in row:
+            row["hard_vote"] = compute_hard_vote(row)
+        if "soft_vote" not in row:
+            row["soft_vote"] = compute_soft_vote(row)
+    class_metrics = compute_class_metrics(horizontal_rows)
     return {
-        "summary": summary_data.get("summary_per_core", {}),
+        "summary": per_core_summary,
         "horizontal_rows": horizontal_rows[:200],
         "output_files": {k: str(v) for k, v in paths.items()},
         "truncated": len(horizontal_rows) > 200,
         "total_horizontal_rows": len(horizontal_rows),
         "warnings": ["Resultados reutilizados: ya existían exportaciones para esta selección."],
         "exported_now": False,
+        "class_labels": extract_class_labels(horizontal_rows),
+        "comparison_accuracy": compute_comparison_accuracy(horizontal_rows, per_core_summary),
+        "ensemble_error_rows": build_ensemble_error_rows(horizontal_rows),
+        "confusion_matrices": compute_confusion_matrices(horizontal_rows),
+        "class_metrics": class_metrics.get("by_method", {}),
+        "class_metric_labels": class_metrics.get("labels", []),
     }
 
 
@@ -207,14 +222,236 @@ def build_horizontal_table(core_rows: Dict[str, List[ImagePrediction]]) -> List[
             per_key[row.image_key]["expected_label"] = row.expected_label
             per_key[row.image_key][f"{core}_pred"] = row.predicted_label or "error"
             per_key[row.image_key][f"{core}_score"] = row.score
+            per_key[row.image_key][f"{core}_result_json"] = json.dumps(row.result_dict, ensure_ascii=False)
     output_rows = []
     for image_key in sorted(per_key.keys()):
         row = per_key[image_key]
         for core in CORES:
             row.setdefault(f"{core}_pred", "-")
             row.setdefault(f"{core}_score", None)
+            row.setdefault(f"{core}_result_json", "{}")
+        row["hard_vote"] = compute_hard_vote(row)
+        row["soft_vote"] = compute_soft_vote(row)
         output_rows.append(row)
     return output_rows
+
+
+def compute_mean_probs(row: Dict) -> Dict[str, float]:
+    class_sums: Dict[str, float] = defaultdict(float)
+    class_counts: Dict[str, int] = defaultdict(int)
+    for core in CORES:
+        raw = row.get(f"{core}_result_json", "{}")
+        try:
+            d = json.loads(raw) if isinstance(raw, str) else (raw or {})
+            for label, prob in d.items():
+                class_sums[label] += float(prob)
+                class_counts[label] += 1
+        except (json.JSONDecodeError, ValueError, TypeError):
+            pass
+    if not class_sums:
+        return {}
+    return {label: class_sums[label] / class_counts[label] for label in class_sums}
+
+
+def compute_hard_vote(row: Dict) -> str:
+    counts: Dict[str, int] = defaultdict(int)
+    for core in CORES:
+        pred = row.get(f"{core}_pred", "")
+        if pred and pred not in ("-", "error"):
+            counts[pred] += 1
+    if not counts:
+        return "-"
+    max_count = max(counts.values())
+    winners = sorted(label for label, c in counts.items() if c == max_count)
+    return "uncertain" if len(winners) > 1 else winners[0]
+
+
+def compute_soft_vote(row: Dict) -> str:
+    avg_probs = compute_mean_probs(row)
+    if not avg_probs:
+        return "-"
+    max_prob = max(avg_probs.values())
+    winners = sorted(label for label, p in avg_probs.items() if abs(p - max_prob) < 1e-9)
+    return "uncertain" if len(winners) > 1 else winners[0]
+
+
+def build_ensemble_error_rows(horizontal_rows: List[Dict]) -> List[Dict]:
+    rows = []
+    for row in horizontal_rows:
+        expected = row.get("expected_label", "")
+        hard = row.get("hard_vote", "-")
+        soft = row.get("soft_vote", "-")
+        if hard == "-" and soft == "-":
+            continue
+        if hard == expected and soft == expected:
+            continue
+        mean_probs = compute_mean_probs(row)
+        error_row: Dict = {
+            "image_key": row.get("image_key"),
+            "expected_label": expected,
+            "hard_vote": hard,
+            "soft_vote": soft,
+            "mean_result_json": json.dumps(mean_probs, ensure_ascii=False),
+        }
+        for core in CORES:
+            error_row[f"{core}_pred"] = row.get(f"{core}_pred", "-")
+            error_row[f"{core}_result_json"] = row.get(f"{core}_result_json", "{}")
+        rows.append(error_row)
+    return rows
+
+
+def compute_comparison_accuracy(horizontal_rows: List[Dict], per_core_summary: Dict) -> Dict[str, float]:
+    comparison: Dict[str, float] = {}
+    for core in CORES:
+        if core in per_core_summary:
+            comparison[core] = float(per_core_summary[core].get("accuracy_vs_filename_label", 0.0))
+    total = 0
+    hard_correct = 0
+    soft_correct = 0
+    for row in horizontal_rows:
+        expected = row.get("expected_label", "")
+        if not expected or expected == "unknown":
+            continue
+        total += 1
+        if row.get("hard_vote") == expected:
+            hard_correct += 1
+        if row.get("soft_vote") == expected:
+            soft_correct += 1
+    if total > 0:
+        comparison["hard_vote"] = hard_correct / total
+        comparison["soft_vote"] = soft_correct / total
+    return comparison
+
+
+def compute_class_metrics(horizontal_rows: List[Dict]) -> Dict:
+    method_predictions: Dict[str, List] = {core: [] for core in CORES}
+    method_predictions["hard_vote"] = []
+    method_predictions["soft_vote"] = []
+
+    label_set = set()
+    for row in horizontal_rows:
+        expected = row.get("expected_label", "")
+        if not expected or expected == "unknown":
+            continue
+        label_set.add(expected)
+        for core in CORES:
+            pred = row.get(f"{core}_pred", "-")
+            if pred and pred not in ("-", "error"):
+                method_predictions[core].append((expected, pred))
+        for method in ("hard_vote", "soft_vote"):
+            pred = row.get(method, "-")
+            if pred and pred != "-":
+                method_predictions[method].append((expected, pred))
+
+    labels = sorted(label_set)
+    metrics_by_method: Dict[str, Dict] = {}
+    for method, data in method_predictions.items():
+        if not data or not labels:
+            continue
+        per_class = {}
+        uncertain_count = sum(1 for _, predicted in data if predicted == "uncertain")
+        total = len(data)
+        correct = sum(1 for actual, predicted in data if actual == predicted)
+        f1_values = []
+        for label in labels:
+            tp = sum(1 for actual, predicted in data if actual == label and predicted == label)
+            fp = sum(1 for actual, predicted in data if actual != label and predicted == label)
+            fn = sum(1 for actual, predicted in data if actual == label and predicted != label)
+            support = sum(1 for actual, _ in data if actual == label)
+            precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+            recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+            f1 = (2 * precision * recall / (precision + recall)) if (precision + recall) > 0 else 0.0
+            per_class[label] = {
+                "precision": precision,
+                "recall": recall,
+                "f1": f1,
+                "support": support,
+            }
+            f1_values.append(f1)
+        metrics_by_method[method] = {
+            "per_class": per_class,
+            "macro_f1": sum(f1_values) / len(f1_values) if f1_values else 0.0,
+            "accuracy": correct / total if total > 0 else 0.0,
+            "n": total,
+            "uncertain_count": uncertain_count,
+        }
+
+    return {"labels": labels, "by_method": metrics_by_method}
+
+
+def _cm_cell_style(percentage: float, is_diagonal: bool) -> str:
+    if percentage <= 0:
+        return "background:#f8fafc;color:#cbd5e1"
+    intensity = min(0.92, percentage / 100.0 * 0.82 + 0.10)
+    r, g, b = (22, 163, 74) if is_diagonal else (220, 38, 38)
+    text = "white" if intensity > 0.55 else "#111827"
+    return f"background:rgba({r},{g},{b},{intensity:.2f});color:{text};font-weight:600"
+
+
+def compute_confusion_matrices(horizontal_rows: List[Dict]) -> Dict:
+    pairs: Dict[str, List] = {core: [] for core in CORES}
+    pairs["hard_vote"] = []
+    pairs["soft_vote"] = []
+
+    for row in horizontal_rows:
+        expected = row.get("expected_label", "")
+        if not expected or expected == "unknown":
+            continue
+        for core in CORES:
+            pred = row.get(f"{core}_pred", "-")
+            if pred and pred not in ("-", "error"):
+                pairs[core].append((expected, pred))
+        for method in ("hard_vote", "soft_vote"):
+            val = row.get(method, "-")
+            if val and val != "-":
+                pairs[method].append((expected, val))
+
+    result: Dict = {}
+    for method, data in pairs.items():
+        if not data:
+            continue
+        all_labels = sorted(set(a for a, _ in data) | set(p for _, p in data))
+        display_labels = all_labels
+        if method == "hard_vote":
+            display_labels = [label for label in all_labels if label != "uncertain"]
+        if not display_labels:
+            continue
+        counts: Dict[str, Dict[str, int]] = defaultdict(lambda: defaultdict(int))
+        for actual, predicted in data:
+            counts[actual][predicted] += 1
+        rows_out = []
+        for actual in display_labels:
+            row_total = sum(counts[actual][predicted] for predicted in display_labels) or 1
+            cells = []
+            for predicted in display_labels:
+                c = counts[actual][predicted]
+                pct = (c * 100.0) / row_total
+                cells.append({
+                    "predicted": predicted,
+                    "count": c,
+                    "percentage": pct,
+                    "style": _cm_cell_style(pct, predicted == actual),
+                })
+            rows_out.append({"actual": actual, "cells": cells})
+        result[method] = {
+            "labels": display_labels,
+            "rows": rows_out,
+            "uncertain_count": sum(1 for _, predicted in data if predicted == "uncertain"),
+        }
+    return result
+
+
+def extract_class_labels(horizontal_rows: List[Dict]) -> List[str]:
+    labels: set = set()
+    for row in horizontal_rows:
+        for core in CORES:
+            raw = row.get(f"{core}_result_json", "{}")
+            try:
+                d = json.loads(raw) if isinstance(raw, str) else raw
+                labels.update(d.keys())
+            except (json.JSONDecodeError, AttributeError):
+                pass
+    return sorted(labels)
 
 
 def summarize_per_core(core_rows: Dict[str, List[ImagePrediction]]) -> Dict[str, Dict]:
@@ -277,10 +514,10 @@ def build_disagreement_rows(horizontal_rows: List[Dict]) -> List[Dict]:
 
 
 def export_results(
-    run_key: str, core_rows: Dict[str, List[ImagePrediction]], horizontal_rows: List[Dict], summary: Dict
+    run_key: str, experiment: str, core_rows: Dict[str, List[ImagePrediction]], horizontal_rows: List[Dict], summary: Dict
 ) -> Dict[str, Path]:
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    paths = get_output_paths(run_key)
+    paths = get_output_paths(run_key, experiment)
+    next(iter(paths.values())).parent.mkdir(parents=True, exist_ok=True)
     detail_csv = paths["detail_csv"]
     horizontal_csv = paths["horizontal_csv"]
     disagreement_csv = paths["disagreement_csv"]
@@ -404,6 +641,12 @@ def run_job(
                     "truncated": False,
                     "total_horizontal_rows": 0,
                     "warnings": warnings + ["Ejecución cancelada: no se guardaron archivos de resultados."],
+                    "class_labels": [],
+                    "comparison_accuracy": {},
+                    "ensemble_error_rows": [],
+                    "confusion_matrices": {},
+                    "class_metrics": {},
+                    "class_metric_labels": [],
                 }
             return
 
@@ -413,6 +656,11 @@ def run_job(
         horizontal_rows = build_horizontal_table(core_rows)
         summary = summarize_per_core(core_rows)
         run_key = get_run_key(experiment, selected_folder, ov_folder)
+        class_labels = extract_class_labels(horizontal_rows)
+        comparison_accuracy = compute_comparison_accuracy(horizontal_rows, summary)
+        ensemble_error_rows = build_ensemble_error_rows(horizontal_rows)
+        confusion_matrices = compute_confusion_matrices(horizontal_rows)
+        class_metrics = compute_class_metrics(horizontal_rows)
         if should_cancel():
             with JOBS_LOCK:
                 JOBS[job_id]["status"] = "cancelled"
@@ -423,9 +671,15 @@ def run_job(
                     "truncated": len(horizontal_rows) > 200,
                     "total_horizontal_rows": len(horizontal_rows),
                     "warnings": warnings + ["Ejecución cancelada: no se guardaron archivos de resultados."],
+                    "class_labels": class_labels,
+                    "comparison_accuracy": comparison_accuracy,
+                    "ensemble_error_rows": ensemble_error_rows,
+                    "confusion_matrices": confusion_matrices,
+                    "class_metrics": class_metrics.get("by_method", {}),
+                    "class_metric_labels": class_metrics.get("labels", []),
                 }
             return
-        output_files = export_results(run_key, core_rows, horizontal_rows, summary)
+        output_files = export_results(run_key, experiment, core_rows, horizontal_rows, summary)
         result = {
             "summary": summary,
             "horizontal_rows": horizontal_rows[:200],
@@ -434,6 +688,12 @@ def run_job(
             "total_horizontal_rows": len(horizontal_rows),
             "warnings": warnings,
             "exported_now": True,
+            "class_labels": class_labels,
+            "comparison_accuracy": comparison_accuracy,
+            "ensemble_error_rows": ensemble_error_rows,
+            "confusion_matrices": confusion_matrices,
+            "class_metrics": class_metrics.get("by_method", {}),
+            "class_metric_labels": class_metrics.get("labels", []),
         }
         with JOBS_LOCK:
             JOBS[job_id]["status"] = "completed"
@@ -507,7 +767,7 @@ def run_batch():
     ov_folders = list_ov_folders(base_path) if base_path else []
 
     run_key = get_run_key(experiment, selected_folder, ov_folder)
-    if outputs_exist(run_key):
+    if outputs_exist(run_key, experiment):
         return render_template(
             "index.html",
             experiments=experiments,
@@ -516,7 +776,7 @@ def run_batch():
             selected_folder=selected_folder,
             ov_folders=ov_folders,
             selected_ov_folder=ov_folder,
-            result=load_existing_result(run_key),
+            result=load_existing_result(run_key, experiment),
             error=None,
             job_id="",
             job_status=None,

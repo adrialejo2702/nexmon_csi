@@ -32,7 +32,11 @@ OUT_FILE="$(mktemp -t ping_timer.XXXXXX)"
 ping -i "$INTERVALO" "$IP" >"$OUT_FILE" 2>&1 &
 PING_PID=$!
 
-sleep "$TIEMPO"
+for ((TRANSCURRIDO=0; TRANSCURRIDO<TIEMPO; TRANSCURRIDO++)); do
+  printf "\rTiempo transcurrido: %ss" "$TRANSCURRIDO"
+  sleep 1
+done
+printf "\rTiempo transcurrido: %ss\n" "$TIEMPO"
 
 kill -INT "$PING_PID" >/dev/null 2>&1 || true
 wait "$PING_PID" >/dev/null 2>&1 || true

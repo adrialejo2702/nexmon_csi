@@ -29,11 +29,23 @@
             <button type="button" class="secondary" id="browse-up">Subir carpeta</button>
             <button type="button" class="secondary" id="browse-refresh">Actualizar</button>
           </div>
+          <div class="row">
+            <label for="browse-search">Buscar .pcap</label>
+            <input type="text" id="browse-search" placeholder="movimiento, vacio, mixto..." />
+            <button type="button" class="secondary" id="browse-search-clear">Limpiar</button>
+          </div>
+          <div class="row">
+            <button type="button" class="secondary" id="browse-use-all-filtered">Usar todos los filtrados</button>
+          </div>
           <ul class="list" id="browse-list"></ul>
           <label>PCAP seleccionado (relativo a GOLD_DISK)</label>
           <input type="text" id="browse-relative-path" readonly placeholder="Elige un .pcap de la lista" />
           <div style="margin-top:0.75rem">
             <label>Lista de representaciones</label>
+            <div class="row">
+              <button type="button" class="secondary" id="browse-remove-selected">Quitar seleccionados</button>
+              <button type="button" class="secondary" id="browse-clear-all">Vaciar lista</button>
+            </div>
             <ul class="list" id="browse-selected-list"></ul>
           </div>
         </div>
@@ -100,6 +112,12 @@
         <label class="inline-label"><input type="checkbox" id="preview-regular" checked /> Generar vista previa (normal)</label>
         <label class="inline-label"><input type="checkbox" id="preview-combined" /> Generar vista previa combinada (los cuatro cores superpuestos)</label>
         <button type="button" id="preview-btn">Generar vista previa</button>
+        <div class="export-box">
+          <p class="sub">Guardado independiente de vista previa.</p>
+          <label class="inline-label"><input type="checkbox" id="save-preview-normal" checked /> Guardar imagen normal</label>
+          <label class="inline-label"><input type="checkbox" id="save-preview-combined" /> Guardar imagen combinada</label>
+          <button type="button" id="save-preview-images-btn" class="secondary">Guardar imágenes de vista previa</button>
+        </div>
         <p class="sub" id="preview-file-name"></p>
         <div class="sub hidden" id="warning-msg"></div>
         <div id="preview-multi-results"></div>

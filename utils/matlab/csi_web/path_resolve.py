@@ -44,7 +44,19 @@ def safe_relative_under_base(base: Path, rel: str) -> Path:
     return candidate
 
 
-def browse_directory(base: Path, rel: str = "") -> dict:
+def _is_inside_generated_export_dir(root: Path, file_path: Path) -> bool:
+    """Indica si `file_path` cae dentro de una carpeta de exportación generada."""
+    current = file_path.parent
+    while current != root and root in current.parents:
+        parent = current.parent
+        sibling_pcaps = {p.stem for p in parent.iterdir() if p.is_file() and p.suffix.lower() == ".pcap"}
+        if _is_generated_export_dir(current, sibling_pcaps):
+            return True
+        current = parent
+    return False
+
+
+def browse_directory(base: Path, rel: str = "", search: str = "") -> dict:
     """Lista subdirectorios y ficheros .pcap en `base/rel`."""
     current = safe_relative_under_base(base, rel)
     if not current.is_dir():
@@ -61,6 +73,21 @@ def browse_directory(base: Path, rel: str = "") -> dict:
             dirs.append(p.name)
         elif p.suffix.lower() == ".pcap":
             pcaps.append(p.name)
+
+    query = (search or "").strip().lower()
+    if query:
+        recursive_matches: list[str] = []
+        for p in sorted(current.rglob("*.pcap")):
+            rel_parts = p.relative_to(current).parts
+            if any(part.startswith(".") for part in rel_parts):
+                continue
+            if query not in p.name.lower():
+                continue
+            if _is_inside_generated_export_dir(current, p):
+                continue
+            recursive_matches.append(p.relative_to(current).as_posix())
+        pcaps = recursive_matches
+
     prefix = rel.strip().replace("\\", "/").strip("/")
     return {"path": prefix, "directories": dirs, "pcaps": pcaps}
 

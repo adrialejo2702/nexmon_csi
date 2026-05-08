@@ -11,6 +11,8 @@ let currentLabels = [];
 let selectedSummary = null;
 /** @type {{ path: string, selected: boolean }[]} */
 let selectedBrowsePcaps = [];
+let browseSearchTerm = "";
+let currentBrowseData = null;
 
 /** @type {{ kind: "json", body: object } | { kind: "local", file: File } | null} */
 let summaryContext = null;
@@ -256,6 +258,60 @@ function addBrowseSelection(rel) {
   renderBrowseSelectedList();
 }
 
+function syncBrowseRelativeSelectionAfterListChanges() {
+  const input = $("browse-relative-path");
+  if (!input) return;
+  const current = String(input.value || "").trim();
+  if (!current) return;
+  const exists = selectedBrowsePcaps.some((it) => it.path === current);
+  if (!exists) {
+    input.value = "";
+    setPreviewFileName("");
+  }
+}
+
+function removeSelectedBrowseItems() {
+  selectedBrowsePcaps = selectedBrowsePcaps.filter((it) => !it.selected);
+  renderBrowseSelectedList();
+  syncBrowseRelativeSelectionAfterListChanges();
+  updateActionButtons();
+}
+
+function clearAllBrowseItems() {
+  selectedBrowsePcaps = [];
+  renderBrowseSelectedList();
+  const input = $("browse-relative-path");
+  if (input) input.value = "";
+  setPreviewFileName("");
+  updateActionButtons();
+}
+
+function listFilteredBrowsePcaps() {
+  if (!currentBrowseData || !Array.isArray(currentBrowseData.pcaps)) return [];
+  return currentBrowseData.pcaps.map((f) => (browseRelPath ? `${browseRelPath}/${f}` : f));
+}
+
+function useAllFilteredPcaps() {
+  const rels = listFilteredBrowsePcaps();
+  if (!rels.length) return;
+  for (const rel of rels) {
+    addBrowseSelection(rel);
+  }
+  const lastRel = rels[rels.length - 1];
+  $("browse-relative-path").value = lastRel;
+  summaryContext = {
+    kind: "json",
+    body: {
+      mode: "browse",
+      browse_relative_path: lastRel,
+      file_id: "",
+    },
+  };
+  void fetchSummaryJson(summaryContext.body);
+  void loadLabelsForSelectedFile();
+  updateActionButtons();
+}
+
 function detectLabelFromFilename(name) {
   const stem = name.toLowerCase().replace(/\.[^.]+$/, "");
   for (const label of ["movimiento", "vacio"]) {
@@ -348,6 +404,15 @@ function getPreviewModes() {
   return modes;
 }
 
+function getSavePreviewModes() {
+  const normal = Boolean($("save-preview-normal")?.checked);
+  const combined = Boolean($("save-preview-combined")?.checked);
+  const modes = [];
+  if (normal) modes.push(false);
+  if (combined) modes.push(true);
+  return modes;
+}
+
 function hasValidSecondsIntervalInput() {
   const startRaw = $("label-start-sec").value.trim();
   const endRaw = $("label-end-sec").value.trim();
@@ -362,6 +427,7 @@ function updateActionButtons() {
   const hasFile = hasSelectedFile();
   const hasFormats = hasAnyExportFormatSelected();
   $("preview-btn").disabled = !hasFile || getPreviewModes().length === 0;
+  $("save-preview-images-btn").disabled = !hasFile || getSavePreviewModes().length === 0;
   $("export-btn").disabled = !(hasFile && hasFormats);
   $("add-label-btn").disabled = !(hasFile && selectedSummary && hasValidSecondsIntervalInput());
   $("save-labels-btn").disabled = !(hasFile && currentLabels.length > 0);
@@ -641,19 +707,29 @@ function setModePanels() {
 async function loadBrowse(path) {
   showError("");
   showWarning("");
-  const q = path ? `?path=${encodeURIComponent(path)}` : "";
+  const params = new URLSearchParams();
+  if (path) params.set("path", path);
+  const search = browseSearchTerm.trim();
+  if (search) params.set("search", search);
+  const q = params.toString() ? `?${params.toString()}` : "";
   const res = await fetch(`/api/browse${q}`);
   const data = await res.json().catch(() => ({}));
   if (!res.ok) {
     showError(data.detail || res.statusText || "Error al listar");
     return;
   }
-  browseRelPath = data.path || "";
+  currentBrowseData = data;
+  browseRelPath = currentBrowseData.path || "";
   $("browse-path").textContent = browseRelPath || "(raíz)";
+  renderBrowseList();
+}
+
+function renderBrowseList() {
   const ul = $("browse-list");
+  if (!ul || !currentBrowseData) return;
   ul.innerHTML = "";
   const dateDirPattern = /^2026\d{4}$/;
-  const visibleDirectories = (data.directories || []).filter((d) =>
+  const visibleDirectories = (currentBrowseData.directories || []).filter((d) =>
     dateDirPattern.test(String(d)),
   );
 
@@ -675,7 +751,8 @@ async function loadBrowse(path) {
     ul.appendChild(li);
   }
 
-  for (const f of data.pcaps || []) {
+  const visiblePcaps = currentBrowseData.pcaps || [];
+  for (const f of visiblePcaps) {
     const li = document.createElement("li");
     const span = document.createElement("span");
     span.className = "name";
@@ -701,6 +778,12 @@ async function loadBrowse(path) {
     });
     li.appendChild(span);
     li.appendChild(btn);
+    ul.appendChild(li);
+  }
+
+  if (browseSearchTerm.trim() && visiblePcaps.length === 0) {
+    const li = document.createElement("li");
+    li.textContent = "No se encontraron archivos .pcap con ese texto.";
     ul.appendChild(li);
   }
 }
@@ -856,6 +939,7 @@ async function doPreview() {
           continue;
         }
         errors.push(msg || `Error en ${body.browse_relative_path || "archivo"}`);
+        continue;
       }
     }
     if (warnings.length) {
@@ -868,6 +952,77 @@ async function doPreview() {
     }
   } finally {
     $("preview-btn").disabled = false;
+  }
+}
+
+async function doSavePreviewImages() {
+  showError("");
+  showWarning("");
+  const packet_range = "";
+  let baseBodies;
+  try {
+    baseBodies = selectedPreviewBodies();
+  } catch (e) {
+    showError(e instanceof Error ? e.message : "Falta seleccionar fichero");
+    return;
+  }
+  const modes = getSavePreviewModes();
+  if (!modes.length) {
+    showError("Marca al menos una opción para guardar (normal o combinada).");
+    return;
+  }
+
+  const bodies = [];
+  for (const base of baseBodies) {
+    for (const combined of modes) {
+      bodies.push({
+        ...base,
+        packet_range,
+        combined,
+      });
+    }
+  }
+
+  $("save-preview-images-btn").disabled = true;
+  try {
+    const errors = [];
+    let savedCount = 0;
+    const total = bodies.length;
+    for (let idx = 0; idx < bodies.length; idx++) {
+      const body = bodies[idx];
+      showWarning(`Exportando ${idx + 1}/${total}...`);
+      const saveRes = await fetch("/api/preview-save-image", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      const saveData = await saveRes.json().catch(() => ({}));
+      if (!saveRes.ok) {
+        const saveDetail = saveData.detail;
+        const saveMsg =
+          typeof saveDetail === "string"
+            ? saveDetail
+            : Array.isArray(saveDetail)
+              ? saveDetail.map((d) => d.msg || d).join("; ")
+              : saveRes.statusText;
+        errors.push(saveMsg || `Error guardando PNG en ${body.browse_relative_path || "archivo"}`);
+        continue;
+      }
+      if (saveData.status === "ok") savedCount += 1;
+    }
+    if (savedCount > 0 || total > 0) {
+      const failed = Math.max(0, total - savedCount);
+      showWarning(
+        failed > 0
+          ? `Completado: ${savedCount}/${total} (${failed} con error).`
+          : `Exportación completada: ${savedCount}/${total}.`
+      );
+    }
+    if (errors.length) {
+      showError(errors.join(" | "));
+    }
+  } finally {
+    updateActionButtons();
   }
 }
 
@@ -918,10 +1073,8 @@ async function doExportWindows() {
       const label = body.browse_relative_path
         ? body.browse_relative_path.split("/").pop()
         : `fichero ${i + 1}`;
-      setExportProgress(
-        Math.round(10 + (80 * i) / bodies.length),
-        bodies.length > 1 ? `Exportando ${i + 1}/${bodies.length}: ${label}…` : "Guardando imágenes…"
-      );
+      const total = bodies.length;
+      setExportProgress(Math.round(10 + (80 * i) / total), `Exportando ${i + 1}/${total}: ${label}...`);
 
       const payload = { ...body, ...sharedOpts };
       const res = await fetch("/api/export-windows", {
@@ -984,17 +1137,38 @@ async function doExportWindows() {
     status.textContent = lines.join(" | ");
     status.classList.remove("hidden");
   }
-  setExportProgress(100, "✔️ Finalizado");
+  const total = bodies.length;
+  const okCount = results.length;
+  const failed = Math.max(0, total - okCount);
+  setExportProgress(
+    100,
+    failed > 0 ? `Completado: ${okCount}/${total} (${failed} con error).` : `Exportación completada: ${okCount}/${total}.`
+  );
 }
 
 $("mode").addEventListener("change", setModePanels);
 $("browse-up").addEventListener("click", () => loadBrowse(parentBrowsePath()));
 $("browse-refresh").addEventListener("click", () => loadBrowse(browseRelPath));
+$("browse-search").addEventListener("input", (ev) => {
+  browseSearchTerm = String(ev.target?.value || "");
+  void loadBrowse(browseRelPath);
+});
+$("browse-search-clear").addEventListener("click", () => {
+  browseSearchTerm = "";
+  $("browse-search").value = "";
+  void loadBrowse(browseRelPath);
+});
+$("browse-use-all-filtered").addEventListener("click", () => {
+  useAllFilteredPcaps();
+});
+$("browse-remove-selected").addEventListener("click", removeSelectedBrowseItems);
+$("browse-clear-all").addEventListener("click", clearAllBrowseItems);
 
 $("upload-folder").addEventListener("change", onUploadFolderChange);
 
 $("upload-btn").addEventListener("click", doUpload);
 $("preview-btn").addEventListener("click", doPreview);
+$("save-preview-images-btn").addEventListener("click", doSavePreviewImages);
 $("export-btn").addEventListener("click", doExportWindows);
 $("add-label-btn").addEventListener("click", addLabelFromInputs);
 $("save-labels-btn").addEventListener("click", () => {
@@ -1004,7 +1178,14 @@ $("save-labels-btn").addEventListener("click", () => {
   $(id).addEventListener("input", updateActionButtons);
   $(id).addEventListener("change", updateActionButtons);
 });
-["browse-relative-path", "generate-impulse-labeled-images", "preview-regular", "preview-combined"].forEach((id) => {
+[
+  "browse-relative-path",
+  "generate-impulse-labeled-images",
+  "preview-regular",
+  "preview-combined",
+  "save-preview-normal",
+  "save-preview-combined",
+].forEach((id) => {
   $(id).addEventListener("change", updateActionButtons);
 });
 

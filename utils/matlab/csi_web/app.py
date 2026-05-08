@@ -98,9 +98,9 @@ def index() -> FileResponse:
 
 
 @app.get("/api/browse")
-def api_browse(path: str = "") -> dict:
+def api_browse(path: str = "", search: str = "") -> dict:
     try:
-        return browse_directory(GOLD_DISK_BASE, path)
+        return browse_directory(GOLD_DISK_BASE, path, search=search)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -295,6 +295,33 @@ def _detect_label_from_filename(name: str) -> str | None:
         if label in stem:
             return label
     return None
+
+
+def _sanitize_experiment_name(name: str) -> str:
+    stem = Path(name).stem.strip()
+    safe = re.sub(r"[^A-Za-z0-9_-]+", "_", stem).strip("_")
+    return safe or "experimento"
+
+
+def _preview_export_folder_name(logical_name: str) -> str:
+    parts = [p for p in Path(logical_name).stem.split("_") if p]
+    if len(parts) >= 6:
+        selected = [parts[0], parts[1], parts[5]]
+        safe = [re.sub(r"[^A-Za-z0-9_-]+", "_", s).strip("_") for s in selected]
+        safe = [s for s in safe if s]
+        if len(safe) == 3:
+            return "_".join(safe)
+    return _sanitize_experiment_name(logical_name)
+
+
+def _extract_last_time_field(logical_name: str) -> str:
+    parts = [p for p in Path(logical_name).stem.split("_") if p]
+    if not parts:
+        return ""
+    last = parts[-1].strip()
+    if re.fullmatch(r"\d{6}", last):
+        return last
+    return ""
 
 
 def export_window_images(
@@ -521,6 +548,8 @@ def build_preview_png(
     pcap_path: Path,
     packet_range: str,
     bw_fallback: int,
+    title_suffix: str = "",
+    dpi: int = 100,
 ) -> bytes:
     try:
         packet_start, packet_end = cm._parse_packet_range_spec(packet_range)
@@ -577,10 +606,13 @@ def build_preview_png(
         for ax in axes.flatten()[ncores:]:
             ax.axis("off")
 
-    fig.suptitle("Mapas de calor por core", fontsize=14)
+    suptitle = "Mapas de calor por core"
+    if title_suffix:
+        suptitle = f"{suptitle} — {title_suffix}"
+    fig.suptitle(suptitle, fontsize=14)
     fig.tight_layout()
     buf = io.BytesIO()
-    fig.savefig(buf, format="png", dpi=100)
+    fig.savefig(buf, format="png", dpi=max(72, int(dpi)))
     plt.close(fig)
     buf.seek(0)
     return buf.getvalue()
@@ -590,6 +622,8 @@ def build_preview_png_combined(
     pcap_path: Path,
     packet_range: str,
     bw_fallback: int,
+    title_suffix: str = "",
+    dpi: int = 100,
 ) -> bytes:
     try:
         packet_start, packet_end = cm._parse_packet_range_spec(packet_range)
@@ -614,10 +648,13 @@ def build_preview_png_combined(
         ax=ax[0][0],
         packet_numbers=None,
     )
-    fig.suptitle("Mapa de calor combinado", fontsize=14)
+    suptitle = "Mapa de calor combinado"
+    if title_suffix:
+        suptitle = f"{suptitle} — {title_suffix}"
+    fig.suptitle(suptitle, fontsize=14)
     fig.tight_layout()
     buf = io.BytesIO()
-    fig.savefig(buf, format="png", dpi=100)
+    fig.savefig(buf, format="png", dpi=max(72, int(dpi)))
     plt.close(fig)
     buf.seek(0)
     return buf.getvalue()
@@ -701,6 +738,48 @@ def api_preview(body: PreviewBody) -> Response:
         media_type="image/png",
         headers={"Cache-Control": "no-store"},
     )
+
+
+@app.post("/api/preview-save-image")
+def api_preview_save_image(body: PreviewBody) -> dict:
+    try:
+        pcap_path = _resolve_pcap_for_preview(body)
+        logical_name = _logical_pcap_name(pcap_path, body.mode, body.file_id)
+        bw = resolve_bw_fallback_mhz(logical_name)
+        title_suffix = _extract_last_time_field(logical_name)
+        png = (
+            build_preview_png_combined(
+                pcap_path,
+                body.packet_range,
+                bw,
+                title_suffix=title_suffix,
+                dpi=150,
+            )
+            if body.combined
+            else build_preview_png(
+                pcap_path,
+                body.packet_range,
+                bw,
+                title_suffix=title_suffix,
+                dpi=150,
+            )
+        )
+        experiment = _sanitize_experiment_name(logical_name)
+        folder_name = _preview_export_folder_name(logical_name)
+        view_suffix = "combinada" if body.combined else "normal"
+        out_dir = pcap_path.parent / folder_name
+        out_dir.mkdir(parents=True, exist_ok=True)
+        out_path = out_dir / f"{experiment}_{view_suffix}.png"
+        out_path.write_bytes(png)
+        return {
+            "status": "ok",
+            "combined": bool(body.combined),
+        }
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        logger.exception("Error guardando imagen de vista previa")
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
 @app.post("/api/preview-data")

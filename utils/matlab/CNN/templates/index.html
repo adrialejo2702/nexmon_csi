@@ -135,38 +135,375 @@
           </div>
         </section>
 
-        <!-- Tabla horizontal -->
+        <!-- Comparativa de métodos -->
+        {% if result.comparison_accuracy %}
         <section class="card">
-          <h2>Clasificación por imagen</h2>
-          <p class="muted" style="margin:0 0 12px;font-size:12px">
-            Mostrando {{ result.horizontal_rows|length }} de {{ result.total_horizontal_rows }} imágenes.
-            {% if result.truncated %}El CSV exportado contiene el total.{% endif %}
+          <h2>Comparativa de métodos</h2>
+          <p class="muted" style="margin:0 0 16px;font-size:12px">
+            Accuracy de cada core y de los métodos ensemble vs etiqueta real del fichero.
+            Las filas con etiqueta <em>uncertain</em> se cuentan como error.
           </p>
-          <div class="table-wrap">
+          <div style="max-width:560px">
+            <canvas id="accuracy-chart" height="220"></canvas>
+          </div>
+          <div class="table-wrap" style="margin-top:18px">
             <table>
               <thead>
                 <tr>
-                  <th>Imagen</th>
-                  <th>Esperado</th>
-                  <th>core0</th>
-                  <th>core1</th>
-                  <th>core2</th>
-                  <th>core3</th>
+                  <th>Método</th>
+                  <th>Accuracy</th>
+                  <th>Barra</th>
                 </tr>
               </thead>
               <tbody>
-                {% for row in result.horizontal_rows %}
-                <tr>
-                  <td>{{ row.image_key }}</td>
-                  <td>{{ row.expected_label }}</td>
-                  <td>{{ row.core0_pred or "-" }}</td>
-                  <td>{{ row.core1_pred or "-" }}</td>
-                  <td>{{ row.core2_pred or "-" }}</td>
-                  <td>{{ row.core3_pred or "-" }}</td>
+                {% set method_labels = {"core0": "Core 0", "core1": "Core 1", "core2": "Core 2", "core3": "Core 3", "hard_vote": "Hard Voting", "soft_vote": "Soft Voting"} %}
+                {% set ordered_methods = ["core0", "core1", "core2", "core3", "hard_vote", "soft_vote"] %}
+                {% for method in ordered_methods %}
+                {% if method in result.comparison_accuracy %}
+                {% set acc = result.comparison_accuracy[method] %}
+                <tr {% if method in ("hard_vote","soft_vote") %}style="font-weight:600"{% endif %}>
+                  <td>{{ method_labels[method] }}</td>
+                  <td>{{ "%.1f"|format(acc * 100) }}%</td>
+                  <td style="width:200px">
+                    <div style="background:#e5e7eb;border-radius:4px;height:10px">
+                      <div style="background:{% if method == 'soft_vote' %}#6366f1{% elif method == 'hard_vote' %}#0ea5e9{% else %}#94a3b8{% endif %};width:{{ "%.1f"|format(acc * 100) }}%;height:10px;border-radius:4px;transition:width .4s"></div>
+                    </div>
+                  </td>
                 </tr>
+                {% endif %}
                 {% endfor %}
               </tbody>
             </table>
+          </div>
+        </section>
+        {% endif %}
+
+        <!-- Métricas por clase -->
+        {% if result.class_metrics and result.class_metric_labels %}
+        <section class="card">
+          <h2>Métricas por clase</h2>
+          <div style="display:flex;align-items:center;gap:8px;margin-bottom:20px">
+            <div class="view-tabs" id="metrics-tabs">
+              <button class="view-tab active" data-metrics="cores">Cores</button>
+              <button class="view-tab" data-metrics="hard_vote">Hard Vote</button>
+              <button class="view-tab" data-metrics="soft_vote">Soft Vote</button>
+            </div>
+          </div>
+
+          <div id="metrics-view-cores">
+            <div class="cm-grid">
+              {% for core in ["core0", "core1", "core2", "core3"] %}
+              {% if core in result.class_metrics %}
+              {% set m = result.class_metrics[core] %}
+              <div class="cm-card">
+                <h4 class="cm-title">{{ core }}</h4>
+                <div class="table-wrap">
+                  <table>
+                    <thead>
+                      <tr>
+                        <th>Clase</th>
+                        <th>Precision</th>
+                        <th>Recall</th>
+                        <th>F1</th>
+                        <th>Support</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {% for label in result.class_metric_labels %}
+                      {% set c = m.per_class[label] %}
+                      <tr>
+                        <td>{{ label }}</td>
+                        <td>{{ "%.3f"|format(c.precision) }}</td>
+                        <td>{{ "%.3f"|format(c.recall) }}</td>
+                        <td>{{ "%.3f"|format(c.f1) }}</td>
+                        <td>{{ c.support }}</td>
+                      </tr>
+                      {% endfor %}
+                      <tr style="font-weight:600">
+                        <td>Resumen</td>
+                        <td>-</td>
+                        <td>-</td>
+                        <td>{{ "%.3f"|format(m.macro_f1) }}</td>
+                        <td>{{ m.n }}</td>
+                      </tr>
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+              {% endif %}
+              {% endfor %}
+            </div>
+          </div>
+
+          {% for method in ["hard_vote", "soft_vote"] %}
+          <div id="metrics-view-{{ method }}" style="display:none">
+            {% if method in result.class_metrics %}
+            {% set m = result.class_metrics[method] %}
+            <div class="cm-single">
+              <div class="cm-card" style="min-width:520px;max-width:760px;width:100%">
+                <h4 class="cm-title">{{ "Hard Vote" if method == "hard_vote" else "Soft Vote" }}</h4>
+                <div class="table-wrap">
+                  <table>
+                    <thead>
+                      <tr>
+                        <th>Clase</th>
+                        <th>Precision</th>
+                        <th>Recall</th>
+                        <th>F1</th>
+                        <th>Support</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {% for label in result.class_metric_labels %}
+                      {% set c = m.per_class[label] %}
+                      <tr>
+                        <td>{{ label }}</td>
+                        <td>{{ "%.3f"|format(c.precision) }}</td>
+                        <td>{{ "%.3f"|format(c.recall) }}</td>
+                        <td>{{ "%.3f"|format(c.f1) }}</td>
+                        <td>{{ c.support }}</td>
+                      </tr>
+                      {% endfor %}
+                      <tr style="font-weight:600">
+                        <td>Resumen</td>
+                        <td>Acc: {{ "%.3f"|format(m.accuracy) }}</td>
+                        <td>Macro F1: {{ "%.3f"|format(m.macro_f1) }}</td>
+                        <td>Uncertain: {{ m.uncertain_count }}</td>
+                        <td>N: {{ m.n }}</td>
+                      </tr>
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            </div>
+            {% endif %}
+          </div>
+          {% endfor %}
+        </section>
+        {% endif %}
+
+        <!-- Matrices de confusión -->
+        {% if result.confusion_matrices %}
+        <section class="card">
+          <h2>Matrices de confusión</h2>
+          <div style="display:flex;align-items:center;gap:8px;margin-bottom:20px">
+            <div class="view-tabs" id="cm-tabs">
+              <button class="view-tab active" data-cm="cores">Por core</button>
+              <button class="view-tab" data-cm="hard_vote">Hard Vote</button>
+              <button class="view-tab" data-cm="soft_vote">Soft Vote</button>
+            </div>
+          </div>
+
+          <!-- Vista: por core (rejilla 2x2) -->
+          <div id="cm-view-cores">
+            <div class="cm-grid">
+              {% for core in ["core0","core1","core2","core3"] %}
+              {% if core in result.confusion_matrices %}
+              {% set cm = result.confusion_matrices[core] %}
+              <div class="cm-card">
+                <h4 class="cm-title">{{ core }}</h4>
+                <table class="cm-table">
+                  <thead>
+                    <tr>
+                      <th class="cm-corner">Real ╲ Pred</th>
+                      {% for lbl in cm.labels %}<th class="cm-head">{{ lbl }}</th>{% endfor %}
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {% for row in cm.rows %}
+                    <tr>
+                      <th class="cm-head">{{ row.actual }}</th>
+                      {% for cell in row.cells %}
+                      <td class="cm-cell" style="{{ cell.style }}" title="{{ cell.count }} casos">{{ "%.1f"|format(cell.percentage) }}%</td>
+                      {% endfor %}
+                    </tr>
+                    {% endfor %}
+                  </tbody>
+                </table>
+              </div>
+              {% endif %}
+              {% endfor %}
+            </div>
+          </div>
+
+          <!-- Vista: Hard Vote -->
+          <div id="cm-view-hard_vote" style="display:none">
+            {% if "hard_vote" in result.confusion_matrices %}
+            {% set cm = result.confusion_matrices["hard_vote"] %}
+            <p class="muted" style="margin:0 0 10px;font-size:12px">
+              Etiqueta <code>uncertain</code> oculta en esta matriz. Casos uncertain: {{ cm.uncertain_count }}.
+            </p>
+            <div class="cm-single">
+              <table class="cm-table cm-table-lg">
+                <thead>
+                  <tr>
+                    <th class="cm-corner">Real ╲ Pred</th>
+                    {% for lbl in cm.labels %}<th class="cm-head">{{ lbl }}</th>{% endfor %}
+                  </tr>
+                </thead>
+                <tbody>
+                  {% for row in cm.rows %}
+                  <tr>
+                    <th class="cm-head">{{ row.actual }}</th>
+                    {% for cell in row.cells %}
+                    <td class="cm-cell" style="{{ cell.style }}" title="{{ cell.count }} casos">{{ "%.1f"|format(cell.percentage) }}%</td>
+                    {% endfor %}
+                  </tr>
+                  {% endfor %}
+                </tbody>
+              </table>
+            </div>
+            {% endif %}
+          </div>
+
+          <!-- Vista: Soft Vote -->
+          <div id="cm-view-soft_vote" style="display:none">
+            {% if "soft_vote" in result.confusion_matrices %}
+            {% set cm = result.confusion_matrices["soft_vote"] %}
+            <div class="cm-single">
+              <table class="cm-table cm-table-lg">
+                <thead>
+                  <tr>
+                    <th class="cm-corner">Real ╲ Pred</th>
+                    {% for lbl in cm.labels %}<th class="cm-head">{{ lbl }}</th>{% endfor %}
+                  </tr>
+                </thead>
+                <tbody>
+                  {% for row in cm.rows %}
+                  <tr>
+                    <th class="cm-head">{{ row.actual }}</th>
+                    {% for cell in row.cells %}
+                    <td class="cm-cell" style="{{ cell.style }}" title="{{ cell.count }} casos">{{ "%.1f"|format(cell.percentage) }}%</td>
+                    {% endfor %}
+                  </tr>
+                  {% endfor %}
+                </tbody>
+              </table>
+            </div>
+            {% endif %}
+          </div>
+        </section>
+        {% endif %}
+
+        <!-- Tabla principal con tabs -->
+        <section class="card">
+          <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:12px;margin-bottom:16px">
+            <div class="view-tabs" id="view-tabs">
+              <button class="view-tab active" data-view="all">
+                Todas las imágenes <span class="tab-count">{{ result.total_horizontal_rows }}</span>
+              </button>
+              <button class="view-tab" data-view="errors">
+                Etiquetado Errores <span class="tab-count">{{ result.ensemble_error_rows|length }}</span>
+              </button>
+            </div>
+            {% if result.class_labels %}
+            <div class="pred-mode-toggle" id="pred-mode-toggle">
+              <button class="pred-mode-btn active" data-mode="label">Etiqueta</button>
+              {% for lbl in result.class_labels %}
+              <button class="pred-mode-btn" data-mode="prob_{{ lbl }}">{{ lbl }}</button>
+              {% endfor %}
+            </div>
+            {% endif %}
+          </div>
+
+          <!-- Vista: Todas las imágenes -->
+          <div id="view-all">
+            <p class="muted" style="margin:0 0 10px;font-size:12px">
+              Mostrando {{ result.horizontal_rows|length }} de {{ result.total_horizontal_rows }} imágenes.
+              {% if result.truncated %}El CSV exportado contiene el total.{% endif %}
+            </p>
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>Imagen</th>
+                    <th>Esperado</th>
+                    <th>core0</th>
+                    <th>core1</th>
+                    <th>core2</th>
+                    <th>core3</th>
+                    <th class="ensemble-col">Hard Vote</th>
+                    <th class="ensemble-col">Soft Vote</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {% for row in result.horizontal_rows %}
+                  <tr>
+                    <td>{{ row.image_key }}</td>
+                    <td>{{ row.expected_label }}</td>
+                    {% for core in ["core0","core1","core2","core3"] %}
+                    <td class="pred-cell"
+                        data-label="{{ row[core ~ '_pred'] or '-' }}"
+                        data-result="{{ row[core ~ '_result_json'] or '{}' }}">
+                      {{ row[core ~ '_pred'] or "-" }}
+                    </td>
+                    {% endfor %}
+                    <td class="ensemble-col {% if row.hard_vote == row.expected_label %}cell-correct{% elif row.hard_vote == 'uncertain' %}cell-uncertain{% elif row.hard_vote not in ('-', '') %}cell-wrong{% endif %}">
+                      {{ row.hard_vote or "-" }}
+                    </td>
+                    <td class="ensemble-col {% if row.soft_vote == row.expected_label %}cell-correct{% elif row.soft_vote == 'uncertain' %}cell-uncertain{% elif row.soft_vote not in ('-', '') %}cell-wrong{% endif %}">
+                      {{ row.soft_vote or "-" }}
+                    </td>
+                  </tr>
+                  {% endfor %}
+                </tbody>
+              </table>
+            </div>
+          </div>
+
+          <!-- Vista: Errores ensemble -->
+          <div id="view-errors" style="display:none">
+            {% if result.ensemble_error_rows %}
+            <p class="muted" style="margin:0 0 10px;font-size:12px">
+              Imágenes donde Hard Vote <strong>o</strong> Soft Vote fallaron. Las celdas de core muestran la probabilidad de cada clase.
+            </p>
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>Imagen</th>
+                    <th>Esperado</th>
+                    <th>Core 0</th>
+                    <th>Core 1</th>
+                    <th>Core 2</th>
+                    <th>Core 3</th>
+                    <th class="ensemble-col">Media</th>
+                    <th class="ensemble-col">Hard Vote</th>
+                    <th class="ensemble-col">Soft Vote</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {% for row in result.ensemble_error_rows %}
+                  <tr>
+                    <td>{{ row.image_key }}</td>
+                    <td>{{ row.expected_label }}</td>
+                    {% for core in ["core0","core1","core2","core3"] %}
+                    {% set core_pred = row[core ~ '_pred'] or '-' %}
+                    <td class="pred-cell {% if core_pred == row.expected_label %}cell-correct{% elif core_pred not in ('-','error') %}cell-wrong{% endif %}"
+                        data-label="{{ core_pred }}"
+                        data-result="{{ row[core ~ '_result_json'] or '{}' }}">
+                      {{ core_pred }}
+                    </td>
+                    {% endfor %}
+                    <td class="pred-cell ensemble-col"
+                        data-label="{{ row.soft_vote or '-' }}"
+                        data-result="{{ row.mean_result_json or '{}' }}">
+                      {{ row.soft_vote or "-" }}
+                    </td>
+                    <td class="ensemble-col {% if row.hard_vote == row.expected_label %}cell-correct{% elif row.hard_vote == 'uncertain' %}cell-uncertain{% else %}cell-wrong{% endif %}">
+                      {{ row.hard_vote or "-" }}
+                    </td>
+                    <td class="ensemble-col {% if row.soft_vote == row.expected_label %}cell-correct{% elif row.soft_vote == 'uncertain' %}cell-uncertain{% else %}cell-wrong{% endif %}">
+                      {{ row.soft_vote or "-" }}
+                    </td>
+                  </tr>
+                  {% endfor %}
+                </tbody>
+              </table>
+            </div>
+            {% else %}
+            <p class="muted" style="text-align:center;padding:32px 0">Sin errores de ensemble — ambos métodos aciertan en todas las imágenes.</p>
+            {% endif %}
           </div>
         </section>
 
@@ -188,6 +525,133 @@
 
       {% endif %}
     </main>
+
+    <!-- Tabs de vista + Toggle de modo de predicción -->
+    <script>
+      (function () {
+        // --- Confusion matrix tab switching ---
+        const cmTabs = document.getElementById("cm-tabs");
+        if (cmTabs) {
+          cmTabs.querySelectorAll(".view-tab").forEach(function (tab) {
+            tab.addEventListener("click", function () {
+              cmTabs.querySelectorAll(".view-tab").forEach(function (t) { t.classList.remove("active"); });
+              tab.classList.add("active");
+              const view = tab.getAttribute("data-cm");
+              ["cores", "hard_vote", "soft_vote"].forEach(function (v) {
+                const el = document.getElementById("cm-view-" + v);
+                if (el) el.style.display = v === view ? "" : "none";
+              });
+            });
+          });
+        }
+
+        // --- Class metrics tab switching ---
+        const metricsTabs = document.getElementById("metrics-tabs");
+        if (metricsTabs) {
+          metricsTabs.querySelectorAll(".view-tab").forEach(function (tab) {
+            tab.addEventListener("click", function () {
+              metricsTabs.querySelectorAll(".view-tab").forEach(function (t) { t.classList.remove("active"); });
+              tab.classList.add("active");
+              const view = tab.getAttribute("data-metrics");
+              ["cores", "hard_vote", "soft_vote"].forEach(function (v) {
+                const el = document.getElementById("metrics-view-" + v);
+                if (el) el.style.display = v === view ? "" : "none";
+              });
+            });
+          });
+        }
+
+        // --- Table view tab switching ---
+        const viewTabs = document.getElementById("view-tabs");
+        if (viewTabs) {
+          viewTabs.querySelectorAll(".view-tab").forEach(function (tab) {
+            tab.addEventListener("click", function () {
+              viewTabs.querySelectorAll(".view-tab").forEach(function (t) { t.classList.remove("active"); });
+              tab.classList.add("active");
+              const view = tab.getAttribute("data-view");
+              document.getElementById("view-all").style.display = view === "all" ? "" : "none";
+              document.getElementById("view-errors").style.display = view === "errors" ? "" : "none";
+            });
+          });
+        }
+
+        // --- Pred-mode toggle (applies to all .pred-cell in both views) ---
+        const toggle = document.getElementById("pred-mode-toggle");
+        if (!toggle) return;
+        const buttons = toggle.querySelectorAll(".pred-mode-btn");
+
+        function applyMode(mode) {
+          document.querySelectorAll(".pred-cell").forEach(function (cell) {
+            if (mode === "label") {
+              cell.textContent = cell.getAttribute("data-label");
+            } else {
+              const label = mode.replace(/^prob_/, "");
+              var resultData = {};
+              try { resultData = JSON.parse(cell.getAttribute("data-result") || "{}"); } catch (e) {}
+              var val = resultData[label];
+              cell.textContent = (val !== undefined && val !== null)
+                ? (val * 100).toFixed(1) + "%"
+                : "-";
+            }
+          });
+        }
+
+        buttons.forEach(function (btn) {
+          btn.addEventListener("click", function () {
+            buttons.forEach(function (b) { b.classList.remove("active"); });
+            btn.classList.add("active");
+            applyMode(btn.getAttribute("data-mode"));
+          });
+        });
+      })();
+    </script>
+
+    <!-- Gráfica comparativa de accuracy -->
+    {% if result and result.comparison_accuracy %}
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4/dist/chart.umd.min.js"></script>
+    <script>
+      (function() {
+        const acc = {{ result.comparison_accuracy | tojson }};
+        const order = ["core0", "core1", "core2", "core3", "hard_vote", "soft_vote"];
+        const nameMap = { core0: "Core 0", core1: "Core 1", core2: "Core 2", core3: "Core 3", hard_vote: "Hard Voting", soft_vote: "Soft Voting" };
+        const colorMap = { hard_vote: "#0ea5e9", soft_vote: "#6366f1" };
+        const labels = order.filter(k => k in acc).map(k => nameMap[k]);
+        const values = order.filter(k => k in acc).map(k => parseFloat((acc[k] * 100).toFixed(1)));
+        const colors = order.filter(k => k in acc).map(k => colorMap[k] || "#94a3b8");
+        const ctx = document.getElementById("accuracy-chart");
+        if (!ctx) return;
+        new Chart(ctx, {
+          type: "bar",
+          data: {
+            labels,
+            datasets: [{
+              label: "Accuracy (%)",
+              data: values,
+              backgroundColor: colors,
+              borderRadius: 6,
+              borderSkipped: false,
+            }]
+          },
+          options: {
+            indexAxis: "y",
+            responsive: true,
+            plugins: {
+              legend: { display: false },
+              tooltip: { callbacks: { label: ctx => ` ${ctx.parsed.x.toFixed(1)}%` } }
+            },
+            scales: {
+              x: {
+                min: 0, max: 100,
+                ticks: { callback: v => v + "%" },
+                grid: { color: "#f1f5f9" }
+              },
+              y: { grid: { display: false } }
+            }
+          }
+        });
+      })();
+    </script>
+    {% endif %}
 
     <!-- Polling de progreso -->
     {% if job_status and job_status.status not in ("completed", "error", "cancelled") %}
