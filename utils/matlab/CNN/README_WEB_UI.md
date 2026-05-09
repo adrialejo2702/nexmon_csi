@@ -59,20 +59,19 @@ Una fila por imagen, con las predicciones de los cuatro cores en columnas. Es el
 
 ---
 
-### `*_cores_con_diferencias.csv`
+### `*_etiquetas_erroneas.csv`
 
-Solo contiene las imágenes donde al menos dos cores con predicción válida discrepan entre sí. Útil para analizar casos de desacuerdo entre antenas.
+Contiene las imágenes de la vista **Etiquetado Errores**: casos donde `hard_vote` o `soft_vote` no coinciden con la etiqueta esperada.
 
 | Columna | Descripción |
 |---|---|
 | `image_key` | Identificador de la imagen |
 | `expected_label` | Etiqueta real |
-| `reference_label` | Etiqueta más votada entre los cores (equivalente al hard vote local) |
-| `distinct_labels` | Etiquetas distintas presentes, separadas por `\|` (ej. `movimiento\|vacio`) |
-| `num_distinct_labels` | Número de etiquetas distintas entre cores |
-| `cores_different` | Cores que discrepan de `reference_label`, separados por `\|` |
-| `num_cores_different` | Número de cores que discrepan |
 | `core0_pred` … `core3_pred` | Etiqueta predicha por cada core |
+| `core0_result_json` … `core3_result_json` | JSON con probabilidades completas por clase en cada core |
+| `mean_result_json` | JSON con la media de probabilidades entre cores (base de `soft_vote`) |
+| `hard_vote` | Etiqueta final por voto mayoritario |
+| `soft_vote` | Etiqueta final por media de probabilidades |
 
 ---
 
