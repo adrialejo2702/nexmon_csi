@@ -11,7 +11,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 from flask import Flask, abort, jsonify, render_template, request, send_file
 
@@ -32,6 +32,10 @@ ADAPTIVE_GLOBAL_BETA = 0.6
 JOB_TTL_SECONDS = 7200
 
 app = Flask(__name__)
+app.jinja_env.globals.update(
+    adaptive_global_beta=ADAPTIVE_GLOBAL_BETA,
+    adaptive_window_size=ADAPTIVE_WINDOW_SIZE,
+)
 JOBS: Dict[str, Dict] = {}
 JOBS_LOCK = threading.Lock()
 
@@ -110,7 +114,7 @@ def outputs_exist(run_key: str, experiment: str, selected_folder: str) -> bool:
     return all(path.exists() for path in paths.values())
 
 
-def load_existing_result(run_key: str, experiment: str, selected_folder: str) -> Dict:
+def load_existing_result(run_key: str, experiment: str, selected_folder: str, use_labeled_weights: bool = False) -> Dict:
     paths = get_output_paths(run_key, experiment, selected_folder)
     summary_data = json.loads(paths["summary_json"].read_text(encoding="utf-8"))
     horizontal_rows: List[Dict] = []
@@ -125,35 +129,74 @@ def load_existing_result(run_key: str, experiment: str, selected_folder: str) ->
             row["hard_vote"] = compute_hard_vote(row)
         if "soft_vote" not in row:
             row["soft_vote"] = compute_soft_vote(row)
-    attach_core_weights(per_core_summary)
-    apply_weighted_soft_vote(horizontal_rows, per_core_summary)
-    apply_adaptive_weighted_soft_vote(horizontal_rows, per_core_summary)
-    class_metrics = compute_class_metrics(horizontal_rows)
+        if "soft_vote_result_json" not in row:
+            row["soft_vote_result_json"] = json.dumps(compute_mean_probs(row), ensure_ascii=False)
+    is_labeled = detect_labeled_dataset(horizontal_rows)
+    has_weighted_vote = is_labeled
+    if is_labeled:
+        attach_core_weights(per_core_summary)
+        apply_weighted_soft_vote(horizontal_rows, per_core_summary)
+    elif use_labeled_weights:
+        labeled_folder = selected_folder + "_edge_impulse"
+        parts = run_key.split("__", 2)
+        ov_s = parts[2] if len(parts) > 2 else ""
+        labeled_weights = load_labeled_weights(experiment, labeled_folder, ov_s)
+        if labeled_weights:
+            apply_labeled_weights_soft_vote(horizontal_rows, labeled_weights, per_core_summary)
+            has_weighted_vote = True
+    if has_weighted_vote:
+        apply_adaptive_weighted_soft_vote(horizontal_rows, per_core_summary)
+    class_metrics = compute_class_metrics(horizontal_rows, is_labeled)
+    parts = run_key.split("__", 2)
+    experiment_s = parts[0] if len(parts) > 0 else ""
+    folder_s = parts[1] if len(parts) > 1 else ""
+    ov_s = parts[2] if len(parts) > 2 else ""
+    counterpart = find_labeled_counterpart(experiment_s, folder_s, ov_s) if not is_labeled else None
+    labeled_folder, labeled_ov = counterpart if counterpart else (None, None)
+    cross_accuracy = compute_cross_accuracy(run_key, experiment_s, folder_s, labeled_folder, labeled_ov) if labeled_folder else {}
+    if labeled_folder:
+        label_map = load_cross_label_map(experiment_s, labeled_folder, labeled_ov)
+        inject_cross_labels(horizontal_rows, label_map)
     return {
         "summary": per_core_summary,
-        "horizontal_rows": horizontal_rows[:200],
+        "horizontal_rows": horizontal_rows,
         "output_files": {k: str(v) for k, v in paths.items()},
-        "truncated": len(horizontal_rows) > 200,
+        "truncated": False,
         "total_horizontal_rows": len(horizontal_rows),
         "warnings": ["Resultados reutilizados: ya existían exportaciones para esta selección."],
         "exported_now": False,
         "class_labels": extract_class_labels(horizontal_rows),
-        "comparison_accuracy": compute_comparison_accuracy(horizontal_rows, per_core_summary),
-        "ensemble_error_rows": build_ensemble_error_rows(horizontal_rows),
-        "confusion_matrices": compute_confusion_matrices(horizontal_rows),
+        "comparison_accuracy": compute_comparison_accuracy(horizontal_rows, per_core_summary, is_labeled),
+        "ensemble_error_rows": build_ensemble_error_rows(horizontal_rows, is_labeled),
+        "confusion_matrices": compute_confusion_matrices(horizontal_rows, is_labeled),
         "class_metrics": class_metrics.get("by_method", {}),
         "class_metric_labels": class_metrics.get("labels", []),
+        "is_labeled": is_labeled,
+        "has_weighted_vote": has_weighted_vote,
+        "cross_accuracy": cross_accuracy,
     }
 
 
 
 def parse_expected_label(file_name: str) -> str:
-    return file_name.split(".", 1)[0] if "." in file_name else "unknown"
+    if "." not in file_name:
+        return "unknown"
+    prefix, rest = file_name.split(".", 1)
+    # If rest has no further dot it's just the extension → unlabeled file
+    if "." not in rest:
+        return "unknown"
+    return prefix
 
 
 def build_image_key(file_name: str) -> str:
-    # Keeps alignment across cores if prefix label differs or is noisy.
-    return file_name.split(".", 1)[1] if "." in file_name else file_name
+    if "." not in file_name:
+        return file_name
+    prefix, rest = file_name.split(".", 1)
+    # Labeled: "movimiento.img_001.png" → rest = "img_001.png" (has dot) → return rest
+    # Unlabeled: "img_001.png" → rest = "png" (no dot) → return full name for unique key
+    if "." not in rest:
+        return file_name
+    return rest
 
 
 def natural_sort_key(value: str) -> List:
@@ -237,6 +280,7 @@ def build_horizontal_table(core_rows: Dict[str, List[ImagePrediction]]) -> List[
             row.setdefault(f"{core}_result_json", "{}")
         row["hard_vote"] = compute_hard_vote(row)
         row["soft_vote"] = compute_soft_vote(row)
+        row["soft_vote_result_json"] = json.dumps(compute_mean_probs(row), ensure_ascii=False)
         output_rows.append(row)
     return output_rows
 
@@ -362,17 +406,37 @@ def compute_recent_core_reliability(previous_rows: List[Dict]) -> Dict[str, floa
         scores = []
         for row in previous_rows:
             expected = row.get("expected_label", "")
-            if not expected or expected == "unknown":
-                continue
             raw = row.get(f"{core}_result_json", "{}")
             try:
                 d = json.loads(raw) if isinstance(raw, str) else (raw or {})
-                if expected in d:
+                if not d:
+                    continue
+                if expected and expected in d:
+                    # Labeled: prob assigned to the true class
                     scores.append(float(d[expected]))
+                else:
+                    # Unlabeled: top-1 confidence as proxy
+                    scores.append(max(d.values()))
             except (json.JSONDecodeError, ValueError, TypeError):
                 pass
         reliability[core] = sum(scores) / len(scores) if scores else 0.0
     return reliability
+
+
+def detect_labeled_dataset(horizontal_rows: List[Dict]) -> bool:
+    for row in horizontal_rows[:20]:
+        expected = row.get("expected_label", "")
+        if not expected:
+            continue
+        for core in CORES:
+            raw = row.get(f"{core}_result_json", "{}")
+            try:
+                d = json.loads(raw) if isinstance(raw, str) else (raw or {})
+                if expected in d:
+                    return True
+            except (json.JSONDecodeError, ValueError, TypeError):
+                pass
+    return False
 
 
 def compute_adaptive_core_weights(
@@ -406,7 +470,33 @@ def apply_adaptive_weighted_soft_vote(
         row["adaptive_recent_reliability_json"] = json.dumps(recent_reliability, ensure_ascii=False)
 
 
-def build_ensemble_error_rows(horizontal_rows: List[Dict]) -> List[Dict]:
+def load_labeled_weights(experiment: str, labeled_folder: str, preferred_ov: str) -> Dict[str, float]:
+    labeled_ov = resolve_labeled_ov(experiment, labeled_folder, preferred_ov)
+    if not labeled_ov:
+        return {}
+    labeled_run_key = get_run_key(experiment, labeled_folder, labeled_ov)
+    labeled_paths = get_output_paths(labeled_run_key, experiment, labeled_folder)
+    try:
+        labeled_summary = json.loads(labeled_paths["summary_json"].read_text(encoding="utf-8"))
+        labeled_per_core = labeled_summary.get("summary_per_core", {})
+        return compute_core_weights(labeled_per_core)
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def apply_labeled_weights_soft_vote(
+    horizontal_rows: List[Dict], core_weights: Dict[str, float], summary: Dict
+) -> None:
+    for row in horizontal_rows:
+        weighted_probs = compute_weighted_probs(row, core_weights)
+        row["weighted_soft_vote"] = compute_weighted_soft_vote(row, core_weights)
+        row["weighted_soft_result_json"] = json.dumps(weighted_probs, ensure_ascii=False)
+    for core, w in core_weights.items():
+        if core in summary:
+            summary[core]["weighted_soft_weight"] = w
+
+
+def build_ensemble_error_rows(horizontal_rows: List[Dict], is_labeled: bool = True) -> List[Dict]:
     rows = []
     for row in horizontal_rows:
         expected = row.get("expected_label", "")
@@ -416,12 +506,22 @@ def build_ensemble_error_rows(horizontal_rows: List[Dict]) -> List[Dict]:
         adaptive_weighted_soft = row.get("adaptive_weighted_soft_vote", "-")
         if hard == "-" and soft == "-" and weighted_soft == "-" and adaptive_weighted_soft == "-":
             continue
-        if hard == expected and soft == expected and weighted_soft == expected and adaptive_weighted_soft == expected:
-            continue
+        if is_labeled:
+            if hard == expected and soft == expected and weighted_soft == expected and adaptive_weighted_soft == expected:
+                continue
+        else:
+            # Unlabeled: only include rows where cores disagree with each other
+            ok_preds = {
+                core: row.get(f"{core}_pred")
+                for core in CORES
+                if row.get(f"{core}_pred") not in (None, "-", "error")
+            }
+            if len(set(ok_preds.values())) <= 1:
+                continue
         mean_probs = compute_mean_probs(row)
         error_row: Dict = {
             "image_key": row.get("image_key"),
-            "expected_label": expected,
+            "expected_label": expected if is_labeled else "-",
             "hard_vote": hard,
             "soft_vote": soft,
             "weighted_soft_vote": weighted_soft,
@@ -439,7 +539,9 @@ def build_ensemble_error_rows(horizontal_rows: List[Dict]) -> List[Dict]:
     return rows
 
 
-def compute_comparison_accuracy(horizontal_rows: List[Dict], per_core_summary: Dict) -> Dict[str, float]:
+def compute_comparison_accuracy(horizontal_rows: List[Dict], per_core_summary: Dict, is_labeled: bool = True) -> Dict[str, float]:
+    if not is_labeled:
+        return {}
     comparison: Dict[str, float] = {}
     for core in CORES:
         if core in per_core_summary:
@@ -460,7 +562,9 @@ def compute_comparison_accuracy(horizontal_rows: List[Dict], per_core_summary: D
     return comparison
 
 
-def compute_class_metrics(horizontal_rows: List[Dict]) -> Dict:
+def compute_class_metrics(horizontal_rows: List[Dict], is_labeled: bool = True) -> Dict:
+    if not is_labeled:
+        return {"labels": [], "by_method": {}}
     method_predictions: Dict[str, List] = {core: [] for core in CORES}
     for method in ENSEMBLE_METHODS:
         method_predictions[method] = []
@@ -525,7 +629,9 @@ def _cm_cell_style(percentage: float, is_diagonal: bool) -> str:
     return f"background:rgba({r},{g},{b},{intensity:.2f});color:{text};font-weight:600"
 
 
-def compute_confusion_matrices(horizontal_rows: List[Dict]) -> Dict:
+def compute_confusion_matrices(horizontal_rows: List[Dict], is_labeled: bool = True) -> Dict:
+    if not is_labeled:
+        return {}
     pairs: Dict[str, List] = {core: [] for core in CORES}
     for method in ENSEMBLE_METHODS:
         pairs[method] = []
@@ -650,6 +756,144 @@ def build_disagreement_rows(horizontal_rows: List[Dict]) -> List[Dict]:
     return rows
 
 
+def resolve_labeled_ov(experiment: str, labeled_folder: str, preferred_ov: str) -> Optional[str]:
+    """Return the OV folder to use inside the labeled counterpart.
+    Tries preferred_ov first; falls back to any OV that has classified outputs."""
+    labeled_path = GOLD_DISK_DIR / experiment / labeled_folder
+    candidates = [preferred_ov] + [
+        p.name for p in labeled_path.iterdir()
+        if p.is_dir() and p.name != preferred_ov
+    ] if labeled_path.exists() else []
+    for ov in candidates:
+        if outputs_exist(get_run_key(experiment, labeled_folder, ov), experiment, labeled_folder):
+            return ov
+    return None
+
+
+def find_labeled_counterpart(experiment: str, selected_folder: str, ov_folder: str) -> Optional[Tuple[str, str]]:
+    """Return (labeled_folder, labeled_ov) if a classified labeled counterpart exists, else None."""
+    labeled_folder = selected_folder + "_edge_impulse"
+    labeled_path = GOLD_DISK_DIR / experiment / labeled_folder
+    if not labeled_path.exists():
+        return None
+    labeled_ov = resolve_labeled_ov(experiment, labeled_folder, ov_folder)
+    if labeled_ov is None:
+        return None
+    return (labeled_folder, labeled_ov)
+
+
+def load_cross_label_map(experiment: str, labeled_folder: str, ov_folder: str) -> Dict[str, str]:
+    labeled_run_key = get_run_key(experiment, labeled_folder, ov_folder)
+    labeled_paths = get_output_paths(labeled_run_key, experiment, labeled_folder)
+    label_map: Dict[str, str] = {}
+    try:
+        with labeled_paths["horizontal_csv"].open(newline="", encoding="utf-8") as f:
+            for r in csv.DictReader(f):
+                stem = Path(r["image_key"]).stem
+                label_map[stem] = r["expected_label"]
+    except OSError:
+        pass
+    return label_map
+
+
+def inject_cross_labels(horizontal_rows: List[Dict], label_map: Dict[str, str]) -> None:
+    for row in horizontal_rows:
+        stem = Path(row.get("image_key", "")).stem
+        row["cross_expected_label"] = label_map.get(stem, "")
+
+
+def compute_cross_accuracy(
+    unlabeled_run_key: str,
+    experiment: str,
+    unlabeled_folder: str,
+    labeled_folder: str,
+    ov_folder: str,
+) -> Dict:
+    unlabeled_paths = get_output_paths(unlabeled_run_key, experiment, unlabeled_folder)
+    labeled_run_key = get_run_key(experiment, labeled_folder, ov_folder)
+    labeled_paths = get_output_paths(labeled_run_key, experiment, labeled_folder)
+
+    try:
+        unlabeled_rows: List[Dict] = []
+        with unlabeled_paths["horizontal_csv"].open(newline="", encoding="utf-8") as f:
+            unlabeled_rows = list(csv.DictReader(f))
+        labeled_rows: List[Dict] = []
+        with labeled_paths["horizontal_csv"].open(newline="", encoding="utf-8") as f:
+            labeled_rows = list(csv.DictReader(f))
+    except OSError:
+        return {}
+
+    # labeled stem → expected class
+    labeled_by_stem: Dict[str, str] = {}
+    for r in labeled_rows:
+        stem = Path(r["image_key"]).stem
+        labeled_by_stem[stem] = r["expected_label"]
+
+    # unlabeled horizontal rows indexed by stem
+    # image_key may be full filename (new CSVs) or stem (old CSVs)
+    unlabeled_by_stem: Dict[str, Dict] = {}
+    for r in unlabeled_rows:
+        raw_key = r.get("image_key", "")
+        stem = Path(raw_key).stem if "." in raw_key else raw_key
+        if stem:
+            unlabeled_by_stem[stem] = r
+
+    common_stems = set(unlabeled_by_stem.keys()) & set(labeled_by_stem.keys())
+    if not common_stems:
+        return {}
+
+    class_dist: Dict[str, int] = defaultdict(int)
+    for s in common_stems:
+        class_dist[labeled_by_stem[s]] += 1
+
+    # Per-core accuracy
+    per_core: Dict[str, Dict] = {}
+    for core in CORES:
+        correct = 0
+        total = 0
+        for stem in common_stems:
+            pred = unlabeled_by_stem[stem].get(f"{core}_pred", "-")
+            if pred not in ("-", "error", ""):
+                total += 1
+                if pred == labeled_by_stem[stem]:
+                    correct += 1
+        per_core[core] = {
+            "correct": correct,
+            "total": total,
+            "accuracy": correct / total if total else 0.0,
+        }
+
+    # Per-method ensemble accuracy
+    ensemble_methods = ["hard_vote", "soft_vote", "weighted_soft_vote", "adaptive_weighted_soft_vote"]
+    per_method: Dict[str, Dict] = {}
+    for method in ensemble_methods:
+        if not any(unlabeled_by_stem[s].get(method, "-") not in ("-", "") for s in common_stems):
+            continue
+        correct = 0
+        total = 0
+        for stem in common_stems:
+            vote = unlabeled_by_stem[stem].get(method, "-")
+            if vote not in ("-", "uncertain", ""):
+                total += 1
+                if vote == labeled_by_stem[stem]:
+                    correct += 1
+        per_method[method] = {
+            "correct": correct,
+            "total": total,
+            "accuracy": correct / total if total else 0.0,
+        }
+
+    return {
+        "labeled_folder": labeled_folder,
+        "n_unlabeled": len(unlabeled_by_stem),
+        "n_labeled": len(labeled_by_stem),
+        "n_common": len(common_stems),
+        "class_distribution": dict(class_dist),
+        "per_core": per_core,
+        "per_method": per_method,
+    }
+
+
 def export_results(
     run_key: str,
     experiment: str,
@@ -657,6 +901,8 @@ def export_results(
     core_rows: Dict[str, List[ImagePrediction]],
     horizontal_rows: List[Dict],
     summary: Dict,
+    is_labeled: bool = True,
+    ov_folder: str = "",
 ) -> Dict[str, Path]:
     paths = get_output_paths(run_key, experiment, selected_folder)
     next(iter(paths.values())).parent.mkdir(parents=True, exist_ok=True)
@@ -691,6 +937,10 @@ def export_results(
                 "run_key": run_key,
                 "generated_at": datetime.now().isoformat(),
                 "summary_per_core": summary,
+                "is_labeled": is_labeled,
+                "experiment_name": experiment,
+                "folder_name": selected_folder,
+                "ov_name": ov_folder,
             },
             indent=2,
             ensure_ascii=False,
@@ -734,6 +984,7 @@ def run_job(
     selected_folder: str,
     ov_folder: str,
     timeout_seconds: int,
+    use_labeled_weights: bool = False,
 ) -> None:
     with JOBS_LOCK:
         job = JOBS[job_id]
@@ -814,22 +1065,39 @@ def run_job(
 
         summary = summarize_per_core(core_rows)
         horizontal_rows = build_horizontal_table(core_rows)
-        apply_weighted_soft_vote(horizontal_rows, summary)
-        apply_adaptive_weighted_soft_vote(horizontal_rows, summary)
+        is_labeled = detect_labeled_dataset(horizontal_rows)
+        has_weighted_vote = is_labeled
+        if is_labeled:
+            apply_weighted_soft_vote(horizontal_rows, summary)
+        elif use_labeled_weights:
+            labeled_folder_name = selected_folder + "_edge_impulse"
+            labeled_weights = load_labeled_weights(experiment, labeled_folder_name, ov_folder)
+            if labeled_weights:
+                apply_labeled_weights_soft_vote(horizontal_rows, labeled_weights, summary)
+                has_weighted_vote = True
+        if has_weighted_vote:
+            apply_adaptive_weighted_soft_vote(horizontal_rows, summary)
         run_key = get_run_key(experiment, selected_folder, ov_folder)
         class_labels = extract_class_labels(horizontal_rows)
-        comparison_accuracy = compute_comparison_accuracy(horizontal_rows, summary)
-        ensemble_error_rows = build_ensemble_error_rows(horizontal_rows)
-        confusion_matrices = compute_confusion_matrices(horizontal_rows)
-        class_metrics = compute_class_metrics(horizontal_rows)
+        comparison_accuracy = compute_comparison_accuracy(horizontal_rows, summary, is_labeled)
+        ensemble_error_rows = build_ensemble_error_rows(horizontal_rows, is_labeled)
+        confusion_matrices = compute_confusion_matrices(horizontal_rows, is_labeled)
+        class_metrics = compute_class_metrics(horizontal_rows, is_labeled)
+        output_files = export_results(run_key, experiment, selected_folder, core_rows, horizontal_rows, summary, is_labeled, ov_folder)
+        counterpart = find_labeled_counterpart(experiment, selected_folder, ov_folder) if not is_labeled else None
+        labeled_folder, labeled_ov = counterpart if counterpart else (None, None)
+        cross_accuracy = compute_cross_accuracy(run_key, experiment, selected_folder, labeled_folder, labeled_ov) if labeled_folder else {}
+        if labeled_folder:
+            label_map = load_cross_label_map(experiment, labeled_folder, labeled_ov)
+            inject_cross_labels(horizontal_rows, label_map)
         if should_cancel():
             with JOBS_LOCK:
                 JOBS[job_id]["status"] = "cancelled"
                 JOBS[job_id]["result"] = {
                     "summary": summary,
-                    "horizontal_rows": horizontal_rows[:200],
+                    "horizontal_rows": horizontal_rows,
                     "output_files": {},
-                    "truncated": len(horizontal_rows) > 200,
+                    "truncated": False,
                     "total_horizontal_rows": len(horizontal_rows),
                     "warnings": warnings + ["Ejecución cancelada: no se guardaron archivos de resultados."],
                     "class_labels": class_labels,
@@ -838,14 +1106,16 @@ def run_job(
                     "confusion_matrices": confusion_matrices,
                     "class_metrics": class_metrics.get("by_method", {}),
                     "class_metric_labels": class_metrics.get("labels", []),
+                    "is_labeled": is_labeled,
+                    "has_weighted_vote": has_weighted_vote,
+                    "cross_accuracy": cross_accuracy,
                 }
             return
-        output_files = export_results(run_key, experiment, selected_folder, core_rows, horizontal_rows, summary)
         result = {
             "summary": summary,
-            "horizontal_rows": horizontal_rows[:200],
+            "horizontal_rows": horizontal_rows,
             "output_files": {k: str(v) for k, v in output_files.items()},
-            "truncated": len(horizontal_rows) > 200,
+            "truncated": False,
             "total_horizontal_rows": len(horizontal_rows),
             "warnings": warnings,
             "exported_now": True,
@@ -855,6 +1125,9 @@ def run_job(
             "confusion_matrices": confusion_matrices,
             "class_metrics": class_metrics.get("by_method", {}),
             "class_metric_labels": class_metrics.get("labels", []),
+            "is_labeled": is_labeled,
+            "has_weighted_vote": has_weighted_vote,
+            "cross_accuracy": cross_accuracy,
         }
         with JOBS_LOCK:
             JOBS[job_id]["status"] = "completed"
@@ -923,6 +1196,7 @@ def run_batch():
     ov_folder = request.form.get("ov_folder", "").strip()
     timeout_seconds = int(request.form.get("timeout_seconds", "60"))
     force_retag = request.form.get("force_retag") == "1"
+    use_labeled_weights = request.form.get("use_labeled_weights") == "1"
 
     experiments = list_experiments()
     experiment_subdirs = list_experiment_subdirs(experiment) if experiment else []
@@ -939,7 +1213,7 @@ def run_batch():
             selected_folder=selected_folder,
             ov_folders=ov_folders,
             selected_ov_folder=ov_folder,
-            result=load_existing_result(run_key, experiment, selected_folder),
+            result=load_existing_result(run_key, experiment, selected_folder, use_labeled_weights),
             error=None,
             job_id="",
             job_status=None,
@@ -962,7 +1236,7 @@ def run_batch():
         }
     thread = threading.Thread(
         target=run_job,
-        args=(job_id, experiment, selected_folder, ov_folder, timeout_seconds),
+        args=(job_id, experiment, selected_folder, ov_folder, timeout_seconds, use_labeled_weights),
         daemon=True,
     )
     thread.start()
@@ -980,6 +1254,31 @@ def run_batch():
         job_status=build_job_status_payload(JOBS[job_id]),
         history=list_history(),
     )
+
+
+@app.route("/preflight", methods=["GET"])
+def preflight():
+    experiment = request.args.get("experiment", "").strip()
+    selected_folder = request.args.get("selected_folder", "").strip()
+    ov_folder = request.args.get("ov_folder", "").strip()
+    if not experiment or not selected_folder or not ov_folder:
+        return jsonify({"is_unlabeled": False, "labeled_folder": None, "is_classified": False})
+    if selected_folder.endswith("_edge_impulse"):
+        return jsonify({"is_unlabeled": False, "labeled_folder": None, "is_classified": False})
+    labeled_folder_name = selected_folder + "_edge_impulse"
+    labeled_path = GOLD_DISK_DIR / experiment / labeled_folder_name
+    if not labeled_path.exists():
+        return jsonify({"is_unlabeled": True, "labeled_folder": None, "is_classified": False})
+    labeled_ovs = list_ov_folders(labeled_path)
+    if not labeled_ovs:
+        return jsonify({"is_unlabeled": True, "labeled_folder": None, "is_classified": False})
+    labeled_ov = resolve_labeled_ov(experiment, labeled_folder_name, ov_folder)
+    is_classified = labeled_ov is not None
+    return jsonify({
+        "is_unlabeled": True,
+        "labeled_folder": labeled_folder_name,
+        "is_classified": is_classified,
+    })
 
 
 @app.route("/status/<job_id>", methods=["GET"])
@@ -1006,6 +1305,31 @@ def cancel_job(job_id: str):
     return jsonify({"ok": True, "status": "cancelling"})
 
 
+@app.route("/delete/<run_key>", methods=["POST"])
+def delete_run(run_key: str):
+    parts = run_key.split("__", 2)
+    if len(parts) < 2:
+        return jsonify({"error": "invalid run_key"}), 400
+    experiment_s, folder_s = parts[0], parts[1]
+    paths = get_output_paths(run_key, experiment_s, folder_s)
+    deleted = 0
+    for path in paths.values():
+        try:
+            if path.exists():
+                path.unlink()
+                deleted += 1
+        except OSError:
+            pass
+    # Remove the output directory if it is now empty
+    try:
+        out_dir = next(iter(paths.values())).parent
+        if out_dir.exists() and not any(out_dir.iterdir()):
+            out_dir.rmdir()
+    except (OSError, StopIteration):
+        pass
+    return jsonify({"ok": True, "deleted": deleted})
+
+
 def list_history(limit: int = 30) -> List[Dict]:
     if not OUTPUT_DIR.exists():
         return []
@@ -1028,6 +1352,9 @@ def list_history(limit: int = 30) -> List[Dict]:
                 "experiment": parts[0] if len(parts) > 0 else "",
                 "folder": parts[1] if len(parts) > 1 else "",
                 "ov": parts[2] if len(parts) > 2 else "",
+                "experiment_name": data.get("experiment_name", parts[0] if len(parts) > 0 else ""),
+                "folder_name": data.get("folder_name", parts[1] if len(parts) > 1 else ""),
+                "ov_name": data.get("ov_name", parts[2] if len(parts) > 2 else ""),
                 "per_core_accuracy": {
                     core: round(float(info.get("accuracy_vs_filename_label", 0.0)) * 100, 1)
                     for core, info in per_core.items()
@@ -1036,6 +1363,7 @@ def list_history(limit: int = 30) -> List[Dict]:
                     (int(info.get("total_images", 0)) for info in per_core.values()),
                     default=0,
                 ),
+                "is_labeled": data.get("is_labeled", True),
             })
         except Exception:
             continue
@@ -1079,7 +1407,13 @@ def view_results(run_key: str):
     if not outputs_exist(run_key, experiment_safe, folder_safe):
         abort(404)
     try:
-        result = load_existing_result(run_key, experiment_safe, folder_safe)
+        parts3 = run_key.split("__", 2)
+        ov_safe = parts3[2] if len(parts3) > 2 else ""
+        auto_labeled = (
+            not folder_safe.endswith("_edge_impulse")
+            and bool(find_labeled_counterpart(experiment_safe, folder_safe, ov_safe))
+        )
+        result = load_existing_result(run_key, experiment_safe, folder_safe, use_labeled_weights=auto_labeled)
         error = None
     except Exception as exc:
         result = None
@@ -1105,6 +1439,195 @@ def view_results(run_key: str):
         history=list_history(),
         active_run_key=run_key,
     )
+
+
+@app.route("/recalculate", methods=["POST"])
+def recalculate():
+    data = request.get_json(force=True) or {}
+    run_key = data.get("run_key", "").strip()
+    experiment = data.get("experiment", "").strip()
+    folder = data.get("folder", "").strip()
+    ov_folder = data.get("ov_folder", "").strip()
+    try:
+        beta = float(data.get("beta", ADAPTIVE_GLOBAL_BETA))
+        window_size = int(data.get("window_size", ADAPTIVE_WINDOW_SIZE))
+    except (TypeError, ValueError):
+        return jsonify({"error": "Parámetros inválidos"}), 400
+    beta = max(0.0, min(1.0, beta))
+    window_size = max(1, min(100, window_size))
+
+    if not outputs_exist(run_key, experiment, folder):
+        return jsonify({"error": "No existen resultados para esta ejecución"}), 404
+
+    paths = get_output_paths(run_key, experiment, folder)
+    try:
+        summary_data = json.loads(paths["summary_json"].read_text(encoding="utf-8"))
+        horizontal_rows: List[Dict] = []
+        with paths["horizontal_csv"].open(newline="", encoding="utf-8") as f:
+            horizontal_rows = list(csv.DictReader(f))
+    except OSError as exc:
+        return jsonify({"error": str(exc)}), 500
+
+    per_core_summary = summary_data.get("summary_per_core", {})
+    apply_adaptive_weighted_soft_vote(horizontal_rows, per_core_summary, window_size=window_size, beta=beta)
+    is_labeled = detect_labeled_dataset(horizontal_rows)
+
+    # Accuracy metrics
+    accuracy: Dict[str, float] = {}
+    if is_labeled:
+        total = 0
+        correct = 0
+        for row in horizontal_rows:
+            expected = row.get("expected_label", "")
+            if not expected or expected == "unknown":
+                continue
+            total += 1
+            if row.get("adaptive_weighted_soft_vote") == expected:
+                correct += 1
+        accuracy["labeled"] = correct / total if total else 0.0
+        accuracy["total"] = total
+        accuracy["correct"] = correct
+    else:
+        # Cross-validation
+        counterpart = find_labeled_counterpart(experiment, folder, ov_folder)
+        if counterpart:
+            labeled_folder, labeled_ov = counterpart
+            cross = compute_cross_accuracy(run_key, experiment, folder, labeled_folder, labeled_ov)
+            if cross:
+                pm = cross.get("per_method", {})
+                aw = pm.get("adaptive_weighted_soft_vote", {})
+                accuracy["cross_accuracy"] = aw.get("accuracy", 0.0)
+                accuracy["cross_correct"] = aw.get("correct", 0)
+                accuracy["cross_total"] = aw.get("total", 0)
+
+    # Per-frame predictions (first 200 for display)
+    preview = [
+        {
+            "image_key": r.get("image_key"),
+            "expected_label": r.get("expected_label", ""),
+            "adaptive_weighted_soft_vote": r.get("adaptive_weighted_soft_vote", "-"),
+            "adaptive_core_weights_json": r.get("adaptive_core_weights_json", "{}"),
+        }
+        for r in horizontal_rows[:200]
+    ]
+
+    return jsonify({
+        "beta": beta,
+        "window_size": window_size,
+        "accuracy": accuracy,
+        "is_labeled": is_labeled,
+        "preview": preview,
+    })
+
+
+@app.route("/recalculate_weighted", methods=["POST"])
+def recalculate_weighted():
+    data = request.get_json(force=True) or {}
+    run_key = data.get("run_key", "").strip()
+    experiment = data.get("experiment", "").strip()
+    folder = data.get("folder", "").strip()
+    ov_folder = data.get("ov_folder", "").strip()
+    raw_weights = data.get("weights", {}) or {}
+
+    try:
+        requested_weights = {
+            core: max(0.0, float(raw_weights.get(core, 0.0)))
+            for core in CORES
+        }
+    except (TypeError, ValueError):
+        return jsonify({"error": "Pesos inválidos"}), 400
+
+    if sum(requested_weights.values()) <= 0:
+        return jsonify({"error": "Introduce al menos un peso mayor que cero"}), 400
+
+    core_weights = normalize_core_values(requested_weights, {core: 1.0 / len(CORES) for core in CORES})
+
+    if not outputs_exist(run_key, experiment, folder):
+        return jsonify({"error": "No existen resultados para esta ejecución"}), 404
+
+    paths = get_output_paths(run_key, experiment, folder)
+    try:
+        with paths["horizontal_csv"].open(newline="", encoding="utf-8") as f:
+            horizontal_rows: List[Dict] = list(csv.DictReader(f))
+    except OSError as exc:
+        return jsonify({"error": str(exc)}), 500
+
+    for row in horizontal_rows:
+        if "soft_vote" not in row:
+            row["soft_vote"] = compute_soft_vote(row)
+        if "soft_vote_result_json" not in row:
+            row["soft_vote_result_json"] = json.dumps(compute_mean_probs(row), ensure_ascii=False)
+        weighted_probs = compute_weighted_probs(row, core_weights)
+        row["manual_weighted_soft_vote"] = compute_weighted_soft_vote(row, core_weights)
+        row["manual_weighted_result_json"] = json.dumps(weighted_probs, ensure_ascii=False)
+
+    is_labeled = detect_labeled_dataset(horizontal_rows)
+    accuracy: Dict[str, float] = {}
+
+    if is_labeled:
+        total = 0
+        correct = 0
+        soft_correct = 0
+        for row in horizontal_rows:
+            expected = row.get("expected_label", "")
+            if not expected or expected == "unknown":
+                continue
+            total += 1
+            if row.get("manual_weighted_soft_vote") == expected:
+                correct += 1
+            if row.get("soft_vote") == expected:
+                soft_correct += 1
+        accuracy["labeled"] = correct / total if total else 0.0
+        accuracy["soft_vote"] = soft_correct / total if total else 0.0
+        accuracy["total"] = total
+        accuracy["correct"] = correct
+        accuracy["soft_correct"] = soft_correct
+    else:
+        counterpart = find_labeled_counterpart(experiment, folder, ov_folder)
+        if counterpart:
+            labeled_folder, labeled_ov = counterpart
+            label_map = load_cross_label_map(experiment, labeled_folder, labeled_ov)
+            total = 0
+            correct = 0
+            soft_correct = 0
+            for row in horizontal_rows:
+                raw_key = row.get("image_key", "")
+                stem = Path(raw_key).stem if "." in raw_key else raw_key
+                expected = label_map.get(stem, "")
+                if not expected:
+                    continue
+                manual_vote = row.get("manual_weighted_soft_vote", "-")
+                if manual_vote in ("-", "uncertain", ""):
+                    continue
+                total += 1
+                if manual_vote == expected:
+                    correct += 1
+                if row.get("soft_vote") == expected:
+                    soft_correct += 1
+            if total:
+                accuracy["cross_accuracy"] = correct / total
+                accuracy["cross_soft_vote"] = soft_correct / total
+                accuracy["cross_correct"] = correct
+                accuracy["cross_soft_correct"] = soft_correct
+                accuracy["cross_total"] = total
+
+    preview = [
+        {
+            "image_key": r.get("image_key"),
+            "expected_label": r.get("expected_label", ""),
+            "soft_vote": r.get("soft_vote", "-"),
+            "manual_weighted_soft_vote": r.get("manual_weighted_soft_vote", "-"),
+            "manual_weighted_result_json": r.get("manual_weighted_result_json", "{}"),
+        }
+        for r in horizontal_rows[:200]
+    ]
+
+    return jsonify({
+        "weights": core_weights,
+        "accuracy": accuracy,
+        "is_labeled": is_labeled,
+        "preview": preview,
+    })
 
 
 if __name__ == "__main__":
