@@ -1,0 +1,1300 @@
+<!doctype html>
+<html lang="es">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Etiquetado CNN local</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}" />
+  </head>
+  <body>
+    <header class="site-header">
+      <a href="/" class="site-header__brand">
+        <div class="site-header__logo-wrap">
+          <img src="{{ url_for('static', filename='etsetb_logo.png') }}"
+               alt="ETSETB — Escola de Telecomunicació de Barcelona"
+               class="site-header__logo" />
+        </div>
+        <div class="site-header__divider"></div>
+        <div class="site-header__text">
+          <span class="site-header__title">Etiquetado CNN local</span>
+          <span class="site-header__subtitle">CNN · Nexmon CSI · Edge Impulse</span>
+        </div>
+      </a>
+    </header>
+
+    <main class="container">
+
+      {% if error %}
+      <div class="alert error">{{ error }}</div>
+      {% endif %}
+
+      <!-- Estado del job en curso -->
+      {% if job_status and job_status.status not in ("completed", "error", "cancelled") %}
+      <section class="card" id="job-status-card" data-job-id="{{ job_id }}">
+        <h2>Estado de clasificación</h2>
+        <p>
+          Estado: <span class="status-badge status-running" id="job-state">{{ job_status.status }}</span>
+          &nbsp;&nbsp;
+          <span id="job-progress">{{ job_status.progress.done }} / {{ job_status.progress.total }}</span> imágenes
+          &nbsp;&nbsp;
+          <span id="job-eta" class="muted" style="font-size:12px"></span>
+        </p>
+        <div class="progress-wrap">
+          <div class="progress-bar" id="job-progress-bar" style="width:0%"></div>
+        </div>
+        <div class="table-wrap" style="margin-bottom:14px">
+          <table>
+            <thead>
+              <tr><th>Core</th><th>Progreso</th></tr>
+            </thead>
+            <tbody>
+              {% for core, p in job_status.core_progress.items() %}
+              <tr>
+                <td>{{ core }}</td>
+                <td id="core-{{ core }}">{{ p.done }} / {{ p.total }}</td>
+              </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        </div>
+        <button type="button" id="cancel-job-btn" class="btn btn-danger">Cancelar test</button>
+      </section>
+      {% endif %}
+
+      <!-- Formulario de selección -->
+      <section class="card">
+        <h2>Configuración de ejecución</h2>
+        <form action="{{ url_for('run_batch') }}" method="post">
+          <div class="grid">
+            <label>
+              Experimento
+              <select name="experiment" required onchange="window.location='/?experiment='+encodeURIComponent(this.value)">
+                {% for exp in experiments %}
+                <option value="{{ exp }}" {% if exp == selected_experiment %}selected{% endif %}>{{ exp }}</option>
+                {% endfor %}
+              </select>
+            </label>
+
+            <label>
+              Carpeta del experimento
+              <select name="selected_folder" required onchange="window.location='/?experiment='+encodeURIComponent(document.querySelector('select[name=experiment]').value)+'&selected_folder='+encodeURIComponent(this.value)">
+                {% for d in experiment_subdirs %}
+                <option value="{{ d }}" {% if d == selected_folder %}selected{% endif %}>{{ d }}</option>
+                {% endfor %}
+              </select>
+            </label>
+
+            <label>
+              Carpeta OV
+              <select name="ov_folder" required>
+                {% for v in ov_folders %}
+                <option value="{{ v }}" {% if v == selected_ov_folder %}selected{% endif %}>{{ v }}</option>
+                {% endfor %}
+              </select>
+            </label>
+
+            <label>
+              Timeout local por imagen (s)
+              <input type="number" name="timeout_seconds" value="60" min="5" max="300" />
+            </label>
+          </div>
+          <input type="hidden" name="use_labeled_weights" id="use-labeled-weights-input" value="0" />
+          <button type="submit" class="btn btn-primary" id="run-btn">Ejecutar clasificación por lote</button>
+        </form>
+
+        <!-- Modal: versión etiquetada encontrada -->
+        <div id="labeled-modal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.45);z-index:1000;align-items:center;justify-content:center">
+          <div style="background:#fff;border-radius:12px;padding:28px 32px;max-width:480px;width:90%;box-shadow:0 8px 32px rgba(0,0,0,.18)">
+            <h3 style="margin:0 0 10px;font-size:16px" id="modal-title">Versión etiquetada disponible</h3>
+            <p style="margin:0 0 20px;font-size:13px;color:#4b5563;line-height:1.5" id="modal-body"></p>
+            <div style="display:flex;gap:10px;flex-wrap:wrap">
+              <button class="btn btn-primary" id="modal-confirm">Usar pesos de la versión etiquetada</button>
+              <button class="btn btn-neutral" id="modal-cancel-classify">Clasificar versión etiquetada primero</button>
+              <button class="btn btn-neutral" id="modal-skip">Continuar sin pesos</button>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- Nota de configuración -->
+      <section class="card">
+        <h2>Modelos locales por core</h2>
+        <p class="config-note">La inferencia se ejecuta en local con los modelos descargados en <code>CNNv2</code>. Si falta algun binario, ejecuta <code>python3 build_local_models.py</code>.</p>
+      </section>
+
+      <!-- Historial de ejecuciones anteriores -->
+      {% if history %}
+      {% set ark = active_run_key | default("") %}
+      <section class="card">
+        <h2>Historial de ejecuciones <span style="font-size:12px;font-weight:400;color:#6b7280">(últimas {{ history|length }})</span></h2>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>Fecha</th>
+                <th>Experimento</th>
+                <th>Carpeta</th>
+                <th>OV</th>
+                <th>Imágenes</th>
+                <th>Core 0</th>
+                <th>Core 1</th>
+                <th>Core 2</th>
+                <th>Core 3</th>
+                <th>Acciones</th>
+              </tr>
+            </thead>
+            <tbody>
+              {% for run in history %}
+              <tr {% if ark and ark == run.run_key %}style="background:#eff6ff;outline:2px solid #bfdbfe;outline-offset:-1px"{% endif %}>
+                <td>{{ run.generated_at[:19] | replace("T", " ") if run.generated_at else "-" }}</td>
+                <td>{{ run.experiment }}</td>
+                <td title="{{ run.folder }}">{{ run.folder }}</td>
+                <td>{{ run.ov }}</td>
+                <td>{{ run.total_images }}</td>
+                {% if run.is_labeled %}
+                  {% for core in ["core0","core1","core2","core3"] %}
+                  <td>{% if core in run.per_core_accuracy %}{{ run.per_core_accuracy[core] }}%{% else %}-{% endif %}</td>
+                  {% endfor %}
+                {% else %}
+                  <td colspan="4" style="text-align:center;color:#9ca3af;font-style:italic;font-size:11px">Sin etiquetado</td>
+                {% endif %}
+                <td style="white-space:nowrap;display:flex;gap:4px;align-items:center">
+                  <a href="/results/{{ run.run_key }}"
+                     class="btn {% if ark and ark == run.run_key %}btn-primary{% else %}btn-neutral{% endif %}"
+                     style="padding:3px 10px;font-size:11px;text-decoration:none">
+                    {% if ark and ark == run.run_key %}Viendo{% else %}Ver{% endif %}
+                  </a>
+                  <form method="post" action="/run" style="display:inline">
+                    <input type="hidden" name="experiment"      value="{{ run.experiment_name }}">
+                    <input type="hidden" name="selected_folder" value="{{ run.folder_name }}">
+                    <input type="hidden" name="ov_folder"       value="{{ run.ov_name }}">
+                    <input type="hidden" name="timeout_seconds" value="60">
+                    <input type="hidden" name="force_retag"     value="1">
+                    <button type="submit" class="btn btn-neutral"
+                            style="padding:3px 10px;font-size:11px;cursor:pointer"
+                            title="Volver a ejecutar esta clasificación">
+                      ↺
+                    </button>
+                  </form>
+                  <button class="btn btn-neutral btn-delete-run"
+                          data-run-key="{{ run.run_key }}"
+                          style="padding:3px 10px;font-size:11px;cursor:pointer;color:#dc2626;border-color:#fca5a5"
+                          title="Eliminar esta ejecución y sus archivos exportados">
+                    ✕
+                  </button>
+                </td>
+              </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        </div>
+      </section>
+      {% endif %}
+
+      {% if result %}
+
+        {% if result.has_weighted_vote %}
+        <script src="https://cdn.jsdelivr.net/npm/chart.js@4/dist/chart.umd.min.js"></script>
+        {% endif %}
+
+        {% if result.warnings %}
+        <div class="alert warning">
+          <ul style="margin:0;padding-left:18px">
+            {% for w in result.warnings %}<li>{{ w }}</li>{% endfor %}
+          </ul>
+        </div>
+        {% endif %}
+
+        <!-- Resumen por core -->
+        <section class="card">
+          <h2>Resumen por core</h2>
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>Core</th>
+                  <th>Total imágenes</th>
+                  <th>Clasificadas OK</th>
+                  {% if result.is_labeled %}
+                  <th>Accuracy vs etiqueta</th>
+                  {% endif %}
+                  <th>Score medio top-1</th>
+                </tr>
+              </thead>
+              <tbody>
+                {% for core in ["core0","core1","core2","core3"] %}
+                {% if core in result.summary %}
+                {% set s = result.summary[core] %}
+                <tr>
+                  <td>{{ core }}</td>
+                  <td>{{ s.total_images }}</td>
+                  <td>{{ s.successful_calls }}</td>
+                  {% if result.is_labeled %}
+                  <td>{{ "%.1f"|format(s.accuracy_vs_filename_label * 100) }}%</td>
+                  {% endif %}
+                  <td>{{ "%.3f"|format(s.avg_top_score) }}</td>
+                </tr>
+                {% endif %}
+                {% endfor %}
+              </tbody>
+            </table>
+          </div>
+        </section>
+
+        <!-- Validación cruzada con experimento etiquetado -->
+        {% if result.cross_accuracy and result.cross_accuracy.n_common %}
+        {% set ca = result.cross_accuracy %}
+        <section class="card" style="border-left:4px solid #7c3aed">
+          <h2 style="color:#7c3aed">Validación cruzada vs experimento etiquetado</h2>
+          <p class="muted" style="margin:0 0 8px;font-size:12px">
+            Referencia: <strong>{{ ca.labeled_folder }}</strong> &mdash;
+            {{ ca.n_common }} imágenes en común comparadas
+            ({{ ca.n_unlabeled }} sin etiquetar · {{ ca.n_labeled }} etiquetadas).
+          </p>
+          {% if ca.class_distribution %}
+          <p class="muted" style="margin:0 0 16px;font-size:12px">
+            Clases:
+            {% for cls, n in ca.class_distribution.items() %}
+              <strong>{{ cls }}</strong> {{ n }}{% if not loop.last %} &middot;{% endif %}
+            {% endfor %}
+          </p>
+          {% endif %}
+
+          <div class="table-wrap" style="max-width:560px;margin-top:20px">
+            <table>
+              <thead>
+                <tr><th>Método</th><th>Correctas</th><th>Total</th><th>Accuracy</th></tr>
+              </thead>
+              <tbody>
+                {% for core in ["core0","core1","core2","core3"] %}
+                {% if core in ca.per_core %}
+                {% set m = ca.per_core[core] %}
+                <tr>
+                  <td>{{ core }}</td>
+                  <td>{{ m.correct }}</td>
+                  <td>{{ m.total }}</td>
+                  <td><strong>{{ "%.1f"|format(m.accuracy * 100) }}%</strong></td>
+                </tr>
+                {% endif %}
+                {% endfor %}
+                {% if ca.per_method %}
+                {% for method, label in [("hard_vote","Hard Vote"),("soft_vote","Soft Vote")] %}
+                {% if method in ca.per_method %}
+                {% set m = ca.per_method[method] %}
+                <tr style="font-weight:600">
+                  <td>{{ label }}</td>
+                  <td>{{ m.correct }}</td>
+                  <td>{{ m.total }}</td>
+                  <td><strong>{{ "%.1f"|format(m.accuracy * 100) }}%</strong></td>
+                </tr>
+                {% endif %}
+                {% endfor %}
+                {% endif %}
+              </tbody>
+            </table>
+          </div>
+        </section>
+        {% endif %}
+
+        <!-- Comparativa de métodos -->
+        {% if result.comparison_accuracy %}
+        <section class="card">
+          <h2>Comparativa de métodos</h2>
+          <p class="muted" style="margin:0 0 16px;font-size:12px">
+            Accuracy de cada core y de los métodos ensemble vs etiqueta real del fichero.
+            Las filas con etiqueta <em>uncertain</em> se cuentan como error.
+          </p>
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>Método</th>
+                  <th>Accuracy</th>
+                </tr>
+              </thead>
+              <tbody>
+                {% set method_labels = {"core0": "Core 0", "core1": "Core 1", "core2": "Core 2", "core3": "Core 3", "hard_vote": "Hard Voting", "soft_vote": "Soft Voting", "weighted_soft_vote": "Weighted Soft Voting", "adaptive_weighted_soft_vote": "Adaptive Weighted Soft Voting"} %}
+                {% set ordered_methods = ["core0", "core1", "core2", "core3", "hard_vote", "soft_vote", "weighted_soft_vote", "adaptive_weighted_soft_vote"] %}
+                {% for method in ordered_methods %}
+                {% if method in result.comparison_accuracy %}
+                {% set acc = result.comparison_accuracy[method] %}
+                <tr {% if method in ("hard_vote","soft_vote","weighted_soft_vote","adaptive_weighted_soft_vote") %}style="font-weight:600"{% endif %}>
+                  <td>{{ method_labels[method] }}</td>
+                  <td>{{ "%.1f"|format(acc * 100) }}%</td>
+                </tr>
+                {% endif %}
+                {% endfor %}
+              </tbody>
+            </table>
+          </div>
+        </section>
+        {% endif %}
+
+        <!-- Métricas por clase -->
+        {% if result.class_metrics and result.class_metric_labels %}
+        <section class="card">
+          <h2>Métricas por clase</h2>
+          <div style="display:flex;align-items:center;gap:8px;margin-bottom:20px">
+            <div class="view-tabs" id="metrics-tabs">
+              <button class="view-tab active" data-metrics="cores">Cores</button>
+              <button class="view-tab" data-metrics="hard_vote">Hard Vote</button>
+              <button class="view-tab" data-metrics="soft_vote">Soft Vote</button>
+              {% if result.is_labeled %}<button class="view-tab" data-metrics="weighted_soft_vote">Weighted Soft Vote</button>{% endif %}
+              <button class="view-tab" data-metrics="adaptive_weighted_soft_vote">Adaptive Weighted Soft Vote</button>
+            </div>
+          </div>
+
+          <div id="metrics-view-cores">
+            <div class="cm-grid">
+              {% for core in ["core0", "core1", "core2", "core3"] %}
+              {% if core in result.class_metrics %}
+              {% set m = result.class_metrics[core] %}
+              <div class="cm-card">
+                <h4 class="cm-title">{{ core }}</h4>
+                <div class="table-wrap">
+                  <table>
+                    <thead>
+                      <tr>
+                        <th>Clase</th>
+                        <th>Precision</th>
+                        <th>Recall</th>
+                        <th>F1</th>
+                        <th>Support</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {% for label in result.class_metric_labels %}
+                      {% set c = m.per_class[label] %}
+                      <tr>
+                        <td>{{ label }}</td>
+                        <td>{{ "%.3f"|format(c.precision) }}</td>
+                        <td>{{ "%.3f"|format(c.recall) }}</td>
+                        <td>{{ "%.3f"|format(c.f1) }}</td>
+                        <td>{{ c.support }}</td>
+                      </tr>
+                      {% endfor %}
+                      <tr style="font-weight:600">
+                        <td>Resumen</td>
+                        <td>-</td>
+                        <td>-</td>
+                        <td>{{ "%.3f"|format(m.macro_f1) }}</td>
+                        <td>{{ m.n }}</td>
+                      </tr>
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+              {% endif %}
+              {% endfor %}
+            </div>
+          </div>
+
+          {% set metric_titles = {"hard_vote": "Hard Vote", "soft_vote": "Soft Vote", "weighted_soft_vote": "Weighted Soft Vote", "adaptive_weighted_soft_vote": "Adaptive Weighted Soft Vote"} %}
+          {% for method in (["hard_vote", "soft_vote", "weighted_soft_vote", "adaptive_weighted_soft_vote"] if result.is_labeled else ["hard_vote", "soft_vote", "adaptive_weighted_soft_vote"]) %}
+          <div id="metrics-view-{{ method }}" style="display:none">
+            {% if method in result.class_metrics %}
+            {% set m = result.class_metrics[method] %}
+            <div class="cm-single">
+              <div class="cm-card" style="min-width:520px;max-width:760px;width:100%">
+                <h4 class="cm-title">{{ metric_titles[method] }}</h4>
+                <div class="table-wrap">
+                  <table>
+                    <thead>
+                      <tr>
+                        <th>Clase</th>
+                        <th>Precision</th>
+                        <th>Recall</th>
+                        <th>F1</th>
+                        <th>Support</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {% for label in result.class_metric_labels %}
+                      {% set c = m.per_class[label] %}
+                      <tr>
+                        <td>{{ label }}</td>
+                        <td>{{ "%.3f"|format(c.precision) }}</td>
+                        <td>{{ "%.3f"|format(c.recall) }}</td>
+                        <td>{{ "%.3f"|format(c.f1) }}</td>
+                        <td>{{ c.support }}</td>
+                      </tr>
+                      {% endfor %}
+                      <tr style="font-weight:600">
+                        <td>Resumen</td>
+                        <td>Acc: {{ "%.3f"|format(m.accuracy) }}</td>
+                        <td>Macro F1: {{ "%.3f"|format(m.macro_f1) }}</td>
+                        <td>Uncertain: {{ m.uncertain_count }}</td>
+                        <td>N: {{ m.n }}</td>
+                      </tr>
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            </div>
+            {% endif %}
+          </div>
+          {% endfor %}
+        </section>
+        {% endif %}
+
+        <!-- Matrices de confusión -->
+        {% if result.confusion_matrices %}
+        <section class="card">
+          <h2>Matrices de confusión</h2>
+          <div style="display:flex;align-items:center;gap:8px;margin-bottom:20px">
+            <div class="view-tabs" id="cm-tabs">
+              <button class="view-tab active" data-cm="cores">Por core</button>
+              <button class="view-tab" data-cm="hard_vote">Hard Vote</button>
+              <button class="view-tab" data-cm="soft_vote">Soft Vote</button>
+              {% if result.is_labeled %}<button class="view-tab" data-cm="weighted_soft_vote">Weighted Soft Vote</button>{% endif %}
+              <button class="view-tab" data-cm="adaptive_weighted_soft_vote">Adaptive Weighted Soft Vote</button>
+            </div>
+          </div>
+
+          <!-- Vista: por core (rejilla 2x2) -->
+          <div id="cm-view-cores">
+            <div class="cm-grid">
+              {% for core in ["core0","core1","core2","core3"] %}
+              {% if core in result.confusion_matrices %}
+              {% set cm = result.confusion_matrices[core] %}
+              <div class="cm-card">
+                <h4 class="cm-title">{{ core }}</h4>
+                <table class="cm-table">
+                  <thead>
+                    <tr>
+                      <th class="cm-corner">Real ╲ Pred</th>
+                      {% for lbl in cm.labels %}<th class="cm-head">{{ lbl }}</th>{% endfor %}
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {% for row in cm.rows %}
+                    <tr>
+                      <th class="cm-head">{{ row.actual }}</th>
+                      {% for cell in row.cells %}
+                      <td class="cm-cell" style="{{ cell.style }}" title="{{ cell.count }} casos">{{ "%.1f"|format(cell.percentage) }}%</td>
+                      {% endfor %}
+                    </tr>
+                    {% endfor %}
+                  </tbody>
+                </table>
+              </div>
+              {% endif %}
+              {% endfor %}
+            </div>
+          </div>
+
+          <!-- Vista: Hard Vote -->
+          <div id="cm-view-hard_vote" style="display:none">
+            {% if "hard_vote" in result.confusion_matrices %}
+            {% set cm = result.confusion_matrices["hard_vote"] %}
+            <p class="muted" style="margin:0 0 10px;font-size:12px">
+              Etiqueta <code>uncertain</code> oculta en esta matriz. Casos uncertain: {{ cm.uncertain_count }}.
+            </p>
+            <div class="cm-single">
+              <table class="cm-table cm-table-lg">
+                <thead>
+                  <tr>
+                    <th class="cm-corner">Real ╲ Pred</th>
+                    {% for lbl in cm.labels %}<th class="cm-head">{{ lbl }}</th>{% endfor %}
+                  </tr>
+                </thead>
+                <tbody>
+                  {% for row in cm.rows %}
+                  <tr>
+                    <th class="cm-head">{{ row.actual }}</th>
+                    {% for cell in row.cells %}
+                    <td class="cm-cell" style="{{ cell.style }}" title="{{ cell.count }} casos">{{ "%.1f"|format(cell.percentage) }}%</td>
+                    {% endfor %}
+                  </tr>
+                  {% endfor %}
+                </tbody>
+              </table>
+            </div>
+            {% endif %}
+          </div>
+
+          <!-- Vista: Soft Vote -->
+          <div id="cm-view-soft_vote" style="display:none">
+            {% if "soft_vote" in result.confusion_matrices %}
+            {% set cm = result.confusion_matrices["soft_vote"] %}
+            <div class="cm-single">
+              <table class="cm-table cm-table-lg">
+                <thead>
+                  <tr>
+                    <th class="cm-corner">Real ╲ Pred</th>
+                    {% for lbl in cm.labels %}<th class="cm-head">{{ lbl }}</th>{% endfor %}
+                  </tr>
+                </thead>
+                <tbody>
+                  {% for row in cm.rows %}
+                  <tr>
+                    <th class="cm-head">{{ row.actual }}</th>
+                    {% for cell in row.cells %}
+                    <td class="cm-cell" style="{{ cell.style }}" title="{{ cell.count }} casos">{{ "%.1f"|format(cell.percentage) }}%</td>
+                    {% endfor %}
+                  </tr>
+                  {% endfor %}
+                </tbody>
+              </table>
+            </div>
+            {% endif %}
+          </div>
+
+          <!-- Vista: Weighted Soft Vote -->
+          <div id="cm-view-weighted_soft_vote" style="display:none">
+            {% if "weighted_soft_vote" in result.confusion_matrices %}
+            {% set cm = result.confusion_matrices["weighted_soft_vote"] %}
+            <div class="cm-single">
+              <table class="cm-table cm-table-lg">
+                <thead>
+                  <tr>
+                    <th class="cm-corner">Real ╲ Pred</th>
+                    {% for lbl in cm.labels %}<th class="cm-head">{{ lbl }}</th>{% endfor %}
+                  </tr>
+                </thead>
+                <tbody>
+                  {% for row in cm.rows %}
+                  <tr>
+                    <th class="cm-head">{{ row.actual }}</th>
+                    {% for cell in row.cells %}
+                    <td class="cm-cell" style="{{ cell.style }}" title="{{ cell.count }} casos">{{ "%.1f"|format(cell.percentage) }}%</td>
+                    {% endfor %}
+                  </tr>
+                  {% endfor %}
+                </tbody>
+              </table>
+            </div>
+            {% endif %}
+          </div>
+
+          <!-- Vista: Adaptive Weighted Soft Vote -->
+          <div id="cm-view-adaptive_weighted_soft_vote" style="display:none">
+            {% if "adaptive_weighted_soft_vote" in result.confusion_matrices %}
+            {% set cm = result.confusion_matrices["adaptive_weighted_soft_vote"] %}
+            <div class="cm-single">
+              <table class="cm-table cm-table-lg">
+                <thead>
+                  <tr>
+                    <th class="cm-corner">Real ╲ Pred</th>
+                    {% for lbl in cm.labels %}<th class="cm-head">{{ lbl }}</th>{% endfor %}
+                  </tr>
+                </thead>
+                <tbody>
+                  {% for row in cm.rows %}
+                  <tr>
+                    <th class="cm-head">{{ row.actual }}</th>
+                    {% for cell in row.cells %}
+                    <td class="cm-cell" style="{{ cell.style }}" title="{{ cell.count }} casos">{{ "%.1f"|format(cell.percentage) }}%</td>
+                    {% endfor %}
+                  </tr>
+                  {% endfor %}
+                </tbody>
+              </table>
+            </div>
+            {% endif %}
+          </div>
+        </section>
+        {% endif %}
+
+        {% if result.has_weighted_vote %}
+        <!-- Experimento de parámetros adaptativos -->
+        <section class="card" style="border-left:4px solid #f59e0b">
+          <h2 style="color:#b45309">Experimento: parámetros adaptativos</h2>
+          <p class="muted" style="font-size:12px;margin:0 0 16px">
+            Recalcula el voto adaptativo sobre los datos ya clasificados sin volver a inferir.
+            Ajusta <strong>beta</strong> (peso del historial global, 0 = solo reciente · 1 = solo global)
+            y el <strong>tamaño de ventana</strong> (nº de frames recientes considerados).
+          </p>
+          <div style="display:flex;gap:24px;flex-wrap:wrap;align-items:flex-end;margin-bottom:16px">
+            <label style="display:flex;flex-direction:column;gap:4px;font-size:13px;font-weight:600">
+              Beta (peso global)
+              <div style="display:flex;align-items:center;gap:8px">
+                <input type="range" id="exp-beta" min="0" max="1" step="0.05" value="{{ '%.2f'|format(0.6) }}"
+                       style="width:160px" oninput="document.getElementById('exp-beta-val').textContent=parseFloat(this.value).toFixed(2)">
+                <span id="exp-beta-val" style="font-weight:700;min-width:36px">0.60</span>
+              </div>
+            </label>
+            <label style="display:flex;flex-direction:column;gap:4px;font-size:13px;font-weight:600">
+              Ventana (frames)
+              <input type="number" id="exp-window" min="1" max="100" value="5"
+                     style="width:80px;padding:5px 8px;border:1px solid #d1d5db;border-radius:6px;font-size:13px">
+            </label>
+            <button class="btn btn-primary" id="exp-run-btn" style="align-self:flex-end">Recalcular</button>
+          </div>
+          <div id="exp-result" style="display:none">
+            <div id="exp-accuracy-summary" style="margin-bottom:12px;font-size:13px"></div>
+            <canvas id="exp-chart" style="max-width:600px;max-height:220px;margin-bottom:16px"></canvas>
+            <p style="font-size:12px;color:#6b7280;margin:0 0 6px">Primeras 200 predicciones:</p>
+            <div class="table-wrap" style="max-height:260px;overflow-y:auto">
+              <table id="exp-preview-table">
+                <thead>
+                  <tr>
+                    <th>Imagen</th>
+                    {% if result.is_labeled %}<th>Esperado</th>{% endif %}
+                    <th>Adaptativo original</th>
+                    <th>Adaptativo nuevo</th>
+                  </tr>
+                </thead>
+                <tbody id="exp-preview-body"></tbody>
+              </table>
+            </div>
+          </div>
+          <script>
+          (function () {
+            const runKey   = {{ (result.output_files.summary_json or "").split("/outputs/")[-1].split("/")[0] | tojson }};
+            const meta = {
+              run_key:   {{ (result.output_files.summary_json or "") | tojson }}.split("/outputs/")[1]
+                            ? {{ (result.output_files.summary_json or "") | tojson }}.split("/outputs/")[1].split("_resumen")[0]
+                            : "",
+              experiment: {{ selected_experiment | tojson }},
+              folder:     {{ selected_folder | tojson }},
+              ov_folder:  {{ selected_ov_folder | tojson }},
+              is_labeled: {{ result.is_labeled | tojson }},
+            };
+            // extract run_key from summary_json path
+            const summaryPath = {{ result.output_files.get("summary_json","") | tojson }};
+            const rkMatch = summaryPath.match(/outputs\/[^/]+\/[^/]+\/(.+)_resumen_metricas\.json$/);
+            meta.run_key = rkMatch ? rkMatch[1] : "";
+
+            // Original adaptive accuracy for comparison
+            const origAcc = {{ result.comparison_accuracy.get("adaptive_weighted_soft_vote", "null") if result.comparison_accuracy else "null" }};
+            const crossOrigAcc = {{ result.cross_accuracy.get("per_method", {}).get("adaptive_weighted_soft_vote", {}).get("accuracy", "null") if result.cross_accuracy else "null" }};
+
+            // Current row predictions (for diff column)
+            const origPreds = {};
+            {% for row in result.horizontal_rows[:200] %}
+            origPreds[{{ row.image_key | tojson }}] = {{ (row.adaptive_weighted_soft_vote or "-") | tojson }};
+            {% endfor %}
+
+            let expChart = null;
+
+            document.getElementById("exp-run-btn").addEventListener("click", function () {
+              const beta = parseFloat(document.getElementById("exp-beta").value);
+              const windowSize = parseInt(document.getElementById("exp-window").value, 10);
+              const btn = this;
+              btn.disabled = true;
+              btn.textContent = "Calculando…";
+
+              fetch("/recalculate", {
+                method: "POST",
+                headers: {"Content-Type": "application/json"},
+                body: JSON.stringify({
+                  run_key: meta.run_key,
+                  experiment: meta.experiment,
+                  folder: meta.folder,
+                  ov_folder: meta.ov_folder,
+                  beta: beta,
+                  window_size: windowSize,
+                })
+              })
+              .then(r => r.json())
+              .then(data => {
+                btn.disabled = false;
+                btn.textContent = "Recalcular";
+                if (data.error) { alert("Error: " + data.error); return; }
+
+                const resultDiv = document.getElementById("exp-result");
+                resultDiv.style.display = "";
+
+                // Accuracy summary
+                const accDiv = document.getElementById("exp-accuracy-summary");
+                let html = "";
+                const acc = data.accuracy || {};
+                if (acc.labeled !== undefined) {
+                  const newPct = (acc.labeled * 100).toFixed(1);
+                  const origPct = origAcc !== null ? (origAcc * 100).toFixed(1) : "—";
+                  const delta = origAcc !== null ? ((acc.labeled - origAcc) * 100).toFixed(1) : null;
+                  const color = delta === null ? "" : (parseFloat(delta) >= 0 ? "color:#059669" : "color:#dc2626");
+                  html = `Accuracy: <strong>${newPct}%</strong> (original: ${origPct}%`
+                       + (delta !== null ? `, <span style="${color}">Δ ${delta > 0 ? "+" : ""}${delta}%</span>` : "")
+                       + `) · ${acc.correct}/${acc.total} correctas`;
+                } else if (acc.cross_accuracy !== undefined) {
+                  const newPct = (acc.cross_accuracy * 100).toFixed(1);
+                  const origPct = crossOrigAcc !== null ? (crossOrigAcc * 100).toFixed(1) : "—";
+                  const delta = crossOrigAcc !== null ? ((acc.cross_accuracy - crossOrigAcc) * 100).toFixed(1) : null;
+                  const color = delta === null ? "" : (parseFloat(delta) >= 0 ? "color:#059669" : "color:#dc2626");
+                  html = `Accuracy cruzada: <strong>${newPct}%</strong> (original: ${origPct}%`
+                       + (delta !== null ? `, <span style="${color}">Δ ${delta > 0 ? "+" : ""}${delta}%</span>` : "")
+                       + `) · ${acc.cross_correct}/${acc.cross_total} correctas`;
+                } else {
+                  html = "Sin métricas disponibles (sin etiquetas ni validación cruzada).";
+                }
+                accDiv.innerHTML = html;
+
+                // Chart (beta sweep comparison)
+                const chartCanvas = document.getElementById("exp-chart");
+                if (typeof Chart !== "undefined" && chartCanvas) {
+                  if (expChart) { expChart.destroy(); expChart = null; }
+                  const newVal = acc.labeled !== undefined ? acc.labeled : (acc.cross_accuracy || 0);
+                  const origVal = acc.labeled !== undefined ? (origAcc || 0) : (crossOrigAcc || 0);
+                  expChart = new Chart(chartCanvas, {
+                    type: "bar",
+                    data: {
+                      labels: ["Original (β=" + {{ adaptive_global_beta | default(0.6) }} + ", w=" + {{ adaptive_window_size | default(5) }} + ")", `Nuevo (β=${beta.toFixed(2)}, w=${windowSize})`],
+                      datasets: [{
+                        label: "Accuracy (%)",
+                        data: [(origVal * 100).toFixed(1), (newVal * 100).toFixed(1)],
+                        backgroundColor: ["#94a3b8", "#10b981"],
+                        borderRadius: 6,
+                        borderSkipped: false,
+                      }]
+                    },
+                    options: {
+                      responsive: true,
+                      plugins: { legend: { display: false }, tooltip: { callbacks: { label: c => c.parsed.y + "%" } } },
+                      scales: { y: { beginAtZero: true, max: 100, ticks: { callback: v => v + "%" } } }
+                    }
+                  });
+                }
+
+                // Preview table
+                const tbody = document.getElementById("exp-preview-body");
+                tbody.innerHTML = "";
+                (data.preview || []).forEach(function (row) {
+                  const orig = origPreds[row.image_key] || "-";
+                  const nw = row.adaptive_weighted_soft_vote || "-";
+                  const changed = orig !== nw;
+                  const tr = document.createElement("tr");
+                  if (changed) tr.style.background = "#fef9c3";
+                  let cells = `<td style="font-size:11px">${row.image_key}</td>`;
+                  if (meta.is_labeled) cells += `<td>${row.expected_label || "-"}</td>`;
+                  cells += `<td>${orig}</td><td style="font-weight:${changed?"700":"400"}">${nw}</td>`;
+                  tr.innerHTML = cells;
+                  tbody.appendChild(tr);
+                });
+              })
+              .catch(function () {
+                btn.disabled = false;
+                btn.textContent = "Recalcular";
+                alert("Error de conexión.");
+              });
+            });
+          })();
+          </script>
+        </section>
+        {% endif %}
+
+        <!-- Tabla principal con tabs -->
+        <section class="card">
+          <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:12px;margin-bottom:16px">
+            <div class="view-tabs" id="view-tabs">
+              <button class="view-tab active" data-view="all">
+                Todas las imágenes <span class="tab-count">{{ result.total_horizontal_rows }}</span>
+              </button>
+              <button class="view-tab" data-view="errors">
+                Discrepancias <span class="tab-count">{{ result.ensemble_error_rows|length }}</span>
+              </button>
+            </div>
+            {% if result.class_labels %}
+            <div class="pred-mode-toggle" id="pred-mode-toggle">
+              <button class="pred-mode-btn active" data-mode="label">Etiqueta</button>
+              {% for lbl in result.class_labels %}
+              <button class="pred-mode-btn" data-mode="prob_{{ lbl }}">{{ lbl }}</button>
+              {% endfor %}
+            </div>
+            {% endif %}
+          </div>
+
+          <!-- Vista: Todas las imágenes -->
+          <div style="margin-bottom:10px;display:flex;align-items:center;gap:12px;flex-wrap:wrap">
+            <input type="text" id="table-filter" placeholder="Filtrar por imagen o etiqueta…"
+              style="width:280px;padding:7px 10px;font-size:12px;border:1px solid #d1d5db;border-radius:6px;outline:none;font-family:inherit" />
+            <span class="muted" style="font-size:12px">
+              Mostrando <span id="filter-count" data-total="{{ result.total_horizontal_rows }}">{{ result.total_horizontal_rows }}</span> de {{ result.total_horizontal_rows }} imágenes
+            </span>
+          </div>
+
+          <div id="view-all">
+            <div class="table-wrap" id="all-table-wrap" style="max-height:65vh;overflow-y:auto;overflow-x:auto">
+              <table>
+                <thead>
+                  <tr>
+                    <th style="position:sticky;top:0;background:#f8fafc;z-index:2">Imagen</th>
+                    <th style="position:sticky;top:0;background:#f8fafc;z-index:2">Esperado</th>
+                    {% if not result.is_labeled %}
+                    <th style="position:sticky;top:0;background:#ecfdf5;z-index:2;color:#059669;font-weight:700">Sin etiqueta</th>
+                    {% endif %}
+                    <th style="position:sticky;top:0;background:#f8fafc;z-index:2">core0</th>
+                    <th style="position:sticky;top:0;background:#f8fafc;z-index:2">core1</th>
+                    <th style="position:sticky;top:0;background:#f8fafc;z-index:2">core2</th>
+                    <th style="position:sticky;top:0;background:#f8fafc;z-index:2">core3</th>
+                    <th class="ensemble-col" style="position:sticky;top:0;background:#f8fafc;z-index:2">Hard Vote</th>
+                    <th class="ensemble-col" style="position:sticky;top:0;background:#f8fafc;z-index:2">Soft Vote</th>
+                    {% if result.is_labeled and result.has_weighted_vote %}<th class="ensemble-col" style="position:sticky;top:0;background:#f8fafc;z-index:2">Weighted Soft Vote</th>{% endif %}
+                    {% if result.is_labeled and result.has_weighted_vote %}<th class="ensemble-col" style="position:sticky;top:0;background:#f8fafc;z-index:2">Adaptive Weighted Soft Vote</th>{% endif %}
+                  </tr>
+                </thead>
+                <tbody id="all-tbody">
+                  {% for row in result.horizontal_rows %}
+                  {% set ref_label = row.cross_expected_label if row.cross_expected_label else row.expected_label %}
+                  {% set has_ref = ref_label and ref_label not in ('unknown', '-', '') %}
+                  {% set cnn_label = row.soft_vote or row.hard_vote or '-' %}
+                  <tr class="data-row" style="{% if loop.index0 >= 60 %}display:none{% endif %}">
+                    <td>{{ row.image_key }}</td>
+                    <td>
+                      {% if row.cross_expected_label %}
+                        <span style="font-weight:600;color:#7c3aed" title="Etiqueta del experimento etiquetado">{{ row.cross_expected_label }}</span>
+                      {% elif row.expected_label and row.expected_label != 'unknown' %}
+                        {{ row.expected_label }}
+                      {% else %}
+                        <span class="muted">—</span>
+                      {% endif %}
+                    </td>
+                    {% if not result.is_labeled %}
+                    <td style="font-weight:600;color:#059669">
+                      {% if cnn_label and cnn_label not in ('-', 'uncertain') %}
+                        {{ cnn_label }}
+                      {% elif cnn_label == 'uncertain' %}
+                        <span style="color:#f59e0b">?</span>
+                      {% else %}
+                        <span class="muted">—</span>
+                      {% endif %}
+                    </td>
+                    {% endif %}
+                    {% for core in ["core0","core1","core2","core3"] %}
+                    <td class="pred-cell {% if has_ref and row[core ~ '_pred'] == ref_label %}cell-correct{% elif has_ref and row[core ~ '_pred'] not in ('-','error','') %}cell-wrong{% endif %}"
+                        data-label="{{ row[core ~ '_pred'] or '-' }}"
+                        data-result="{{ row[core ~ '_result_json'] or '{}' }}">
+                      {{ row[core ~ '_pred'] or "-" }}
+                    </td>
+                    {% endfor %}
+                    <td class="ensemble-col {% if has_ref and row.hard_vote == ref_label %}cell-correct{% elif row.hard_vote == 'uncertain' %}cell-uncertain{% elif has_ref and row.hard_vote not in ('-', '') %}cell-wrong{% endif %}">
+                      {{ row.hard_vote or "-" }}
+                    </td>
+                    <td class="pred-cell ensemble-col {% if has_ref and row.soft_vote == ref_label %}cell-correct{% elif row.soft_vote == 'uncertain' %}cell-uncertain{% elif has_ref and row.soft_vote not in ('-', '') %}cell-wrong{% endif %}"
+                        data-label="{{ row.soft_vote or '-' }}"
+                        data-result="{{ row.soft_vote_result_json or '{}' }}">
+                      {{ row.soft_vote or "-" }}
+                    </td>
+                    {% if result.is_labeled and result.has_weighted_vote %}
+                    <td class="pred-cell ensemble-col {% if has_ref and row.weighted_soft_vote == ref_label %}cell-correct{% elif row.weighted_soft_vote == 'uncertain' %}cell-uncertain{% elif has_ref and row.weighted_soft_vote not in ('-', '') %}cell-wrong{% endif %}"
+                        data-label="{{ row.weighted_soft_vote or '-' }}"
+                        data-result="{{ row.weighted_soft_result_json or '{}' }}">
+                      {{ row.weighted_soft_vote or "-" }}
+                    </td>
+                    {% endif %}
+                    {% if result.is_labeled and result.has_weighted_vote %}
+                    <td class="pred-cell ensemble-col {% if has_ref and row.adaptive_weighted_soft_vote == ref_label %}cell-correct{% elif row.adaptive_weighted_soft_vote == 'uncertain' %}cell-uncertain{% elif has_ref and row.adaptive_weighted_soft_vote not in ('-', '') %}cell-wrong{% endif %}"
+                        data-label="{{ row.adaptive_weighted_soft_vote or '-' }}"
+                        data-result="{{ row.adaptive_weighted_result_json or '{}' }}"
+                        title="Pesos: {{ row.adaptive_core_weights_json or '{}' }}">
+                      {{ row.adaptive_weighted_soft_vote or "-" }}
+                    </td>
+                    {% endif %}
+                  </tr>
+                  {% endfor %}
+                  <tr id="scroll-sentinel"><td colspan="20" style="padding:0;border:none"></td></tr>
+                </tbody>
+              </table>
+            </div>
+          </div>
+
+          <!-- Vista: Errores ensemble -->
+          <div id="view-errors" style="display:none">
+            {% if result.ensemble_error_rows %}
+            <p class="muted" style="margin:0 0 10px;font-size:12px">
+              {% if result.is_labeled %}Imágenes donde algún método ensemble no coincidió con la etiqueta real.{% else %}Imágenes donde los cores no se pusieron de acuerdo entre sí.{% endif %} Las celdas de core muestran la probabilidad de cada clase.
+            </p>
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>Imagen</th>
+                    <th>Esperado</th>
+                    <th>Core 0</th>
+                    <th>Core 1</th>
+                    <th>Core 2</th>
+                    <th>Core 3</th>
+                    <th class="ensemble-col">Media</th>
+                    <th class="ensemble-col">Hard Vote</th>
+                    <th class="ensemble-col">Soft Vote</th>
+                    {% if result.is_labeled and result.has_weighted_vote %}<th class="ensemble-col">Weighted Soft Vote</th>{% endif %}
+                    {% if result.is_labeled and result.has_weighted_vote %}<th class="ensemble-col">Adaptive Weighted Soft Vote</th>{% endif %}
+                  </tr>
+                </thead>
+                <tbody>
+                  {% for row in result.ensemble_error_rows %}
+                  <tr>
+                    <td>{{ row.image_key }}</td>
+                    <td>{{ row.expected_label }}</td>
+                    {% for core in ["core0","core1","core2","core3"] %}
+                    {% set core_pred = row[core ~ '_pred'] or '-' %}
+                    <td class="pred-cell {% if core_pred == row.expected_label %}cell-correct{% elif core_pred not in ('-','error') %}cell-wrong{% endif %}"
+                        data-label="{{ core_pred }}"
+                        data-result="{{ row[core ~ '_result_json'] or '{}' }}">
+                      {{ core_pred }}
+                    </td>
+                    {% endfor %}
+                    <td class="pred-cell ensemble-col"
+                        data-label="{{ row.soft_vote or '-' }}"
+                        data-result="{{ row.mean_result_json or '{}' }}">
+                      {{ row.soft_vote or "-" }}
+                    </td>
+                    <td class="ensemble-col {% if row.hard_vote == row.expected_label %}cell-correct{% elif row.hard_vote == 'uncertain' %}cell-uncertain{% else %}cell-wrong{% endif %}">
+                      {{ row.hard_vote or "-" }}
+                    </td>
+                    <td class="ensemble-col {% if row.soft_vote == row.expected_label %}cell-correct{% elif row.soft_vote == 'uncertain' %}cell-uncertain{% else %}cell-wrong{% endif %}">
+                      {{ row.soft_vote or "-" }}
+                    </td>
+                    {% if result.is_labeled and result.has_weighted_vote %}
+                    <td class="pred-cell ensemble-col {% if row.weighted_soft_vote == row.expected_label %}cell-correct{% elif row.weighted_soft_vote == 'uncertain' %}cell-uncertain{% else %}cell-wrong{% endif %}"
+                        data-label="{{ row.weighted_soft_vote or '-' }}"
+                        data-result="{{ row.weighted_soft_result_json or '{}' }}">
+                      {{ row.weighted_soft_vote or "-" }}
+                    </td>
+                    {% endif %}
+                    {% if result.is_labeled and result.has_weighted_vote %}
+                    <td class="pred-cell ensemble-col {% if row.adaptive_weighted_soft_vote == row.expected_label %}cell-correct{% elif row.adaptive_weighted_soft_vote == 'uncertain' %}cell-uncertain{% else %}cell-wrong{% endif %}"
+                        data-label="{{ row.adaptive_weighted_soft_vote or '-' }}"
+                        data-result="{{ row.adaptive_weighted_result_json or '{}' }}"
+                        title="Pesos: {{ row.adaptive_core_weights_json or '{}' }} | Fiabilidad reciente: {{ row.adaptive_recent_reliability_json or '{}' }}">
+                      {{ row.adaptive_weighted_soft_vote or "-" }}
+                    </td>
+                    {% endif %}
+                  </tr>
+                  {% endfor %}
+                </tbody>
+              </table>
+            </div>
+            {% else %}
+            <p class="muted" style="text-align:center;padding:32px 0">Sin errores de ensemble — todos los métodos aciertan en todas las imágenes.</p>
+            {% endif %}
+          </div>
+        </section>
+
+        <!-- Archivos exportados -->
+        <section class="card">
+          <h2>Archivos exportados</h2>
+          {% if result.output_files %}
+          <ul style="margin:0;padding-left:0;list-style:none;font-size:13px;display:flex;flex-direction:column;gap:8px">
+            {% for key, label in [("horizontal_csv","Comparativa horizontal"),("disagreement_csv","Errores ensemble"),("detail_csv","Detalle por core"),("summary_json","Resumen métricas")] %}
+            {% if result.output_files[key] %}
+            <li style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
+              <code>{{ result.output_files[key].split('/')[-1] }}</code>
+              <a href="/download?path={{ result.output_files[key] | output_rel }}"
+                 class="btn btn-neutral" style="padding:3px 10px;font-size:11px;text-decoration:none">Descargar</a>
+            </li>
+            {% endif %}
+            {% endfor %}
+          </ul>
+          <p class="muted" style="margin:8px 0 0;font-size:12px">Guardados en <code>outputs/</code></p>
+          {% else %}
+          <p class="muted">No se guardaron archivos (ejecución cancelada).</p>
+          {% endif %}
+        </section>
+
+      {% endif %}
+    </main>
+
+    <!-- Tabs de vista + Toggle de modo de predicción -->
+    <script>
+      (function () {
+        // --- Confusion matrix tab switching ---
+        const cmTabs = document.getElementById("cm-tabs");
+        if (cmTabs) {
+          cmTabs.querySelectorAll(".view-tab").forEach(function (tab) {
+            tab.addEventListener("click", function () {
+              cmTabs.querySelectorAll(".view-tab").forEach(function (t) { t.classList.remove("active"); });
+              tab.classList.add("active");
+              const view = tab.getAttribute("data-cm");
+              ["cores", "hard_vote", "soft_vote", {% if result.has_weighted_vote %}"weighted_soft_vote", "adaptive_weighted_soft_vote"{% endif %}].forEach(function (v) {
+                const el = document.getElementById("cm-view-" + v);
+                if (el) el.style.display = v === view ? "" : "none";
+              });
+            });
+          });
+        }
+
+        // --- Class metrics tab switching ---
+        const metricsTabs = document.getElementById("metrics-tabs");
+        if (metricsTabs) {
+          metricsTabs.querySelectorAll(".view-tab").forEach(function (tab) {
+            tab.addEventListener("click", function () {
+              metricsTabs.querySelectorAll(".view-tab").forEach(function (t) { t.classList.remove("active"); });
+              tab.classList.add("active");
+              const view = tab.getAttribute("data-metrics");
+              ["cores", "hard_vote", "soft_vote", {% if result.has_weighted_vote %}"weighted_soft_vote", "adaptive_weighted_soft_vote"{% endif %}].forEach(function (v) {
+                const el = document.getElementById("metrics-view-" + v);
+                if (el) el.style.display = v === view ? "" : "none";
+              });
+            });
+          });
+        }
+
+        // --- Table view tab switching ---
+        const viewTabs = document.getElementById("view-tabs");
+        if (viewTabs) {
+          viewTabs.querySelectorAll(".view-tab").forEach(function (tab) {
+            tab.addEventListener("click", function () {
+              viewTabs.querySelectorAll(".view-tab").forEach(function (t) { t.classList.remove("active"); });
+              tab.classList.add("active");
+              const view = tab.getAttribute("data-view");
+              document.getElementById("view-all").style.display = view === "all" ? "" : "none";
+              document.getElementById("view-errors").style.display = view === "errors" ? "" : "none";
+            });
+          });
+        }
+
+        // --- Pred-mode toggle (applies to all .pred-cell in both views) ---
+        const toggle = document.getElementById("pred-mode-toggle");
+        if (!toggle) return;
+        const buttons = toggle.querySelectorAll(".pred-mode-btn");
+
+        function applyMode(mode) {
+          document.querySelectorAll(".pred-cell").forEach(function (cell) {
+            if (mode === "label") {
+              cell.textContent = cell.getAttribute("data-label");
+            } else {
+              const label = mode.replace(/^prob_/, "");
+              var resultData = {};
+              try { resultData = JSON.parse(cell.getAttribute("data-result") || "{}"); } catch (e) {}
+              var val = resultData[label];
+              cell.textContent = (val !== undefined && val !== null)
+                ? (val * 100).toFixed(1) + "%"
+                : "-";
+            }
+          });
+        }
+
+        buttons.forEach(function (btn) {
+          btn.addEventListener("click", function () {
+            buttons.forEach(function (b) { b.classList.remove("active"); });
+            btn.classList.add("active");
+            applyMode(btn.getAttribute("data-mode"));
+          });
+        });
+
+        // --- Infinite scroll ---
+        (function () {
+          const tableWrap = document.getElementById("all-table-wrap");
+          const sentinel = document.getElementById("scroll-sentinel");
+          if (!tableWrap || !sentinel) return;
+          const BATCH = 60;
+          const allRows = Array.from(document.querySelectorAll("#all-tbody .data-row"));
+          let revealed = Math.min(BATCH, allRows.length);
+
+          function revealNext() {
+            const next = allRows.slice(revealed, revealed + BATCH);
+            next.forEach(function (r) { if (!r.dataset.filtered) r.style.display = ""; });
+            revealed = Math.min(revealed + BATCH, allRows.length);
+          }
+
+          if ("IntersectionObserver" in window) {
+            const obs = new IntersectionObserver(function (entries) {
+              if (entries[0].isIntersecting && revealed < allRows.length) {
+                revealNext();
+              }
+            }, { root: tableWrap, threshold: 0 });
+            obs.observe(sentinel);
+          } else {
+            tableWrap.addEventListener("scroll", function () {
+              if (tableWrap.scrollTop + tableWrap.clientHeight >= tableWrap.scrollHeight - 40) {
+                revealNext();
+              }
+            });
+          }
+        })();
+
+        // --- Table filter ---
+        const filterInput = document.getElementById("table-filter");
+        const filterCount = document.getElementById("filter-count");
+        if (filterInput) {
+          filterInput.addEventListener("input", function () {
+            const q = filterInput.value.trim().toLowerCase();
+            let visible = 0;
+            const total = parseInt(filterCount ? filterCount.getAttribute("data-total") : "0") || 0;
+
+            // Filter view-all: operate on ALL data-rows (including hidden ones)
+            document.querySelectorAll("#all-tbody .data-row").forEach(function (row) {
+              const cells = row.querySelectorAll("td");
+              const key = cells[0] ? cells[0].textContent.toLowerCase() : "";
+              const lbl = cells[1] ? cells[1].textContent.toLowerCase() : "";
+              const match = !q || key.includes(q) || lbl.includes(q);
+              if (match) {
+                row.style.display = "";
+                delete row.dataset.filtered;
+                visible++;
+              } else {
+                row.style.display = "none";
+                row.dataset.filtered = "1";
+              }
+            });
+
+            // Filter view-errors
+            document.querySelectorAll("#view-errors tbody tr").forEach(function (row) {
+              const cells = row.querySelectorAll("td");
+              const key = cells[0] ? cells[0].textContent.toLowerCase() : "";
+              const lbl = cells[1] ? cells[1].textContent.toLowerCase() : "";
+              const match = !q || key.includes(q) || lbl.includes(q);
+              row.style.display = match ? "" : "none";
+            });
+
+            if (filterCount) filterCount.textContent = q ? visible : total;
+          });
+        }
+
+      })();
+    </script>
+
+    <!-- Polling de progreso -->
+    {% if job_status and job_status.status not in ("completed", "error", "cancelled") %}
+    <script>
+      (function() {
+        const card = document.getElementById("job-status-card");
+        if (!card) return;
+        const jobId = card.getAttribute("data-job-id");
+        const stateEl = document.getElementById("job-state");
+        const progressEl = document.getElementById("job-progress");
+        const progressBarEl = document.getElementById("job-progress-bar");
+        const cancelBtn = document.getElementById("cancel-job-btn");
+
+        const etaEl = document.getElementById("job-eta");
+        let startedAt = null;
+
+        if (cancelBtn) {
+          cancelBtn.addEventListener("click", async () => {
+            cancelBtn.disabled = true;
+            cancelBtn.textContent = "Cancelando…";
+            await fetch(`/cancel/${jobId}`, { method: "POST" });
+          });
+        }
+
+        async function tick() {
+          const res = await fetch(`/status/${jobId}`);
+          if (!res.ok) return;
+          const data = await res.json();
+          stateEl.textContent = data.status;
+          if (data.started_at && !startedAt) startedAt = data.started_at;
+          const done = data.progress?.done ?? 0;
+          const total = data.progress?.total ?? 0;
+          progressEl.textContent = `${done} / ${total}`;
+          const pct = total > 0 ? Math.round((done * 100) / total) : 0;
+          progressBarEl.style.width = `${pct}%`;
+          if (etaEl && startedAt && done > 0 && total > done) {
+            const elapsed = Date.now() / 1000 - startedAt;
+            const rate = done / elapsed;
+            const remaining = (total - done) / rate;
+            if (remaining > 0 && remaining < 86400) {
+              const m = Math.floor(remaining / 60);
+              const s = Math.floor(remaining % 60);
+              etaEl.textContent = m > 0 ? `~${m}m ${s}s restantes` : `~${s}s restantes`;
+            }
+          }
+          for (const [core, coreData] of Object.entries(data.core_progress || {})) {
+            const el = document.getElementById(`core-${core}`);
+            if (el) el.textContent = `${coreData.done} / ${coreData.total}`;
+          }
+          if (data.status === "completed" || data.status === "error" || data.status === "cancelled") {
+            window.location = `/?experiment=${encodeURIComponent(document.querySelector('select[name=experiment]').value)}&selected_folder=${encodeURIComponent(document.querySelector('select[name=selected_folder]').value)}&ov_folder=${encodeURIComponent(document.querySelector('select[name=ov_folder]').value)}&job_id=${jobId}`;
+            return;
+          }
+          setTimeout(tick, 1500);
+        }
+        setTimeout(tick, 1200);
+      })();
+    </script>
+    {% endif %}
+
+    <!-- Intercepción del formulario para detectar versión etiquetada -->
+    <script>
+      (function () {
+        const form = document.querySelector('form[action*="run"]');
+        const modal = document.getElementById("labeled-modal");
+        const modalTitle = document.getElementById("modal-title");
+        const modalBody = document.getElementById("modal-body");
+        const btnConfirm = document.getElementById("modal-confirm");
+        const btnCancelClassify = document.getElementById("modal-cancel-classify");
+        const btnSkip = document.getElementById("modal-skip");
+        const weightInput = document.getElementById("use-labeled-weights-input");
+        if (!form || !modal) return;
+
+        let pendingLabeledFolder = null;
+
+        function closeModal() {
+          modal.style.display = "none";
+        }
+
+        form.addEventListener("submit", function (e) {
+          if (weightInput.value === "1") return;
+          const experiment = form.querySelector('[name=experiment]').value;
+          const selectedFolder = form.querySelector('[name=selected_folder]').value;
+          const ovFolder = form.querySelector('[name=ov_folder]').value;
+          e.preventDefault();
+          fetch(`/preflight?experiment=${encodeURIComponent(experiment)}&selected_folder=${encodeURIComponent(selectedFolder)}&ov_folder=${encodeURIComponent(ovFolder)}`)
+            .then(r => r.json())
+            .then(data => {
+              if (!data.is_unlabeled || !data.labeled_folder) {
+                form.submit();
+                return;
+              }
+              pendingLabeledFolder = data.labeled_folder;
+              if (data.is_classified) {
+                modalTitle.textContent = "Versión etiquetada disponible";
+                modalBody.textContent = `Se encontró la captura etiquetada "${data.labeled_folder}" ya clasificada. Puedes usar sus accuracies por core como pesos para Weighted Soft Vote en esta captura sin etiqueta.`;
+                btnConfirm.style.display = "";
+                btnCancelClassify.style.display = "none";
+              } else {
+                modalTitle.textContent = "Versión etiquetada sin clasificar";
+                modalBody.textContent = `Se encontró la carpeta "${data.labeled_folder}" pero todavía no ha sido clasificada. Para habilitar Weighted Soft Vote necesitas clasificarla primero.`;
+                btnConfirm.style.display = "none";
+                btnCancelClassify.style.display = "";
+              }
+              modal.style.display = "flex";
+            })
+            .catch(() => form.submit());
+        });
+
+        btnConfirm.addEventListener("click", function () {
+          weightInput.value = "1";
+          closeModal();
+          form.submit();
+        });
+
+        btnCancelClassify.addEventListener("click", function () {
+          closeModal();
+          const folderSelect = form.querySelector('[name=selected_folder]');
+          const origValue = folderSelect.value;
+          folderSelect.value = pendingLabeledFolder;
+          if (![...folderSelect.options].some(o => o.value === pendingLabeledFolder)) {
+            const opt = document.createElement("option");
+            opt.value = pendingLabeledFolder;
+            opt.textContent = pendingLabeledFolder;
+            folderSelect.appendChild(opt);
+            folderSelect.value = pendingLabeledFolder;
+          }
+          form.submit();
+          folderSelect.value = origValue;
+        });
+
+        btnSkip.addEventListener("click", function () {
+          weightInput.value = "0";
+          closeModal();
+          form.submit();
+        });
+
+        modal.addEventListener("click", function (e) {
+          if (e.target === modal) closeModal();
+        });
+      })();
+
+      // --- Delete run (always active, no result guard needed) ---
+      document.querySelectorAll(".btn-delete-run").forEach(function (btn) {
+        btn.addEventListener("click", function () {
+          const runKey = btn.getAttribute("data-run-key");
+          if (!confirm("¿Eliminar esta ejecución y todos sus archivos exportados?")) return;
+          fetch("/delete/" + runKey, { method: "POST" })
+            .then(function (r) { return r.json(); })
+            .then(function (data) {
+              if (data.ok) {
+                const row = btn.closest("tr");
+                if (row) row.remove();
+              } else {
+                alert("Error al eliminar: " + (data.error || "desconocido"));
+              }
+            })
+            .catch(function () { alert("Error de conexión al eliminar."); });
+        });
+      });
+    </script>
+  </body>
+</html>

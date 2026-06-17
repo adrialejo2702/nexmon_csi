@@ -1,17 +1,23 @@
+# Kernel / firmware build artifacts
 /BUILD_NUMBER
-*.o.cmd
-*.ko.cmd
-.tmp*
-
 *.o
+*.o.cmd
+*.ko
+*.ko.cmd
+*.mod.c
 modules.order
 Module.symvers
-*.ko
-*.mod.c
+.tmp*
 /gen
 /log
 /obj/
 /src/*.asm
 /src/ucode_compressed.c
 /*-sdio.bin
+
+# Editor
 *.swp
+
+# macOS
+.DS_Store
+**/.DS_Store

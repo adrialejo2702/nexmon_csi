@@ -1,0 +1,11 @@
+# This file is used internally by FFMPEG.
+file 'file:/Users/adrian/Desktop/TFG/Repos/nexmon_csi_master/utils/matlab/CNNv2/media/videos/simple_classifications/1080p60/partial_movie_files/Classifications/2257293077_2765948852_223132457.mp4'
+file 'file:/Users/adrian/Desktop/TFG/Repos/nexmon_csi_master/utils/matlab/CNNv2/media/videos/simple_classifications/1080p60/partial_movie_files/Classifications/2135761390_1432596116_2498648340.mp4'
+file 'file:/Users/adrian/Desktop/TFG/Repos/nexmon_csi_master/utils/matlab/CNNv2/media/videos/simple_classifications/1080p60/partial_movie_files/Classifications/2135761390_3264345552_3927937519.mp4'
+file 'file:/Users/adrian/Desktop/TFG/Repos/nexmon_csi_master/utils/matlab/CNNv2/media/videos/simple_classifications/1080p60/partial_movie_files/Classifications/2135761390_1432596116_4135983557.mp4'
+file 'file:/Users/adrian/Desktop/TFG/Repos/nexmon_csi_master/utils/matlab/CNNv2/media/videos/simple_classifications/1080p60/partial_movie_files/Classifications/2135761390_58544625_1104474446.mp4'
+file 'file:/Users/adrian/Desktop/TFG/Repos/nexmon_csi_master/utils/matlab/CNNv2/media/videos/simple_classifications/1080p60/partial_movie_files/Classifications/2135761390_1432596116_1377138787.mp4'
+file 'file:/Users/adrian/Desktop/TFG/Repos/nexmon_csi_master/utils/matlab/CNNv2/media/videos/simple_classifications/1080p60/partial_movie_files/Classifications/2135761390_112627928_3939929451.mp4'
+file 'file:/Users/adrian/Desktop/TFG/Repos/nexmon_csi_master/utils/matlab/CNNv2/media/videos/simple_classifications/1080p60/partial_movie_files/Classifications/2135761390_1432596116_393067901.mp4'
+file 'file:/Users/adrian/Desktop/TFG/Repos/nexmon_csi_master/utils/matlab/CNNv2/media/videos/simple_classifications/1080p60/partial_movie_files/Classifications/2135761390_1099124624_131853371.mp4'
+file 'file:/Users/adrian/Desktop/TFG/Repos/nexmon_csi_master/utils/matlab/CNNv2/media/videos/simple_classifications/1080p60/partial_movie_files/Classifications/2135761390_1432596116_2772011206.mp4'
